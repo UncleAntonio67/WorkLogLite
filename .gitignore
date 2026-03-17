@@ -1,0 +1,14 @@
+/build/
+/data/
+/dist_portable/
+/portable/data/
+/.vs/
+/.vscode/
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.log
+*.zip
+*.tmp
+*.new.exe

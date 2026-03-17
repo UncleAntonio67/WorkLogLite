@@ -1,6 +1,7 @@
 /build/
 /data/
 /dist_portable/
+/dist_portable_*/
 /portable/data/
 /.vs/
 /.vscode/

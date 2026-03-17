@@ -12,6 +12,7 @@
 #include <richedit.h>
 #include <shellapi.h>
 #include <windowsx.h>
+#include <bcrypt.h>
 
 #include <string>
 #include <vector>
@@ -24,6 +25,7 @@
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 static const wchar_t* kAppTitle = L"WorkLogLite";
 
@@ -41,6 +43,7 @@ enum : UINT {
   IDM_MANAGE_TASKS = 1030,
   IDM_MANAGE_RECURRING_MEETINGS = 1040,
   IDM_GENERATE_DEMO_DATA = 1050,
+  IDM_CHANGE_PASSWORD = 1060,
   IDM_HELP = 1100,
 
   // Context menu (ListView)
@@ -82,6 +85,19 @@ enum : int {
   IDC_LBL_STATUS = 2033,
   IDC_LBL_TITLE = 2034,
   IDC_LBL_BODY = 2035,
+
+  // Body formatting toolbar buttons
+  IDC_FMT_BOLD = 2040,
+  IDC_FMT_ITALIC = 2041,
+  IDC_FMT_UNDERLINE = 2042,
+  IDC_FMT_NUMBERING = 2043,
+  IDC_FMT_BULLET = 2044,
+  IDC_FMT_ALIGN_LEFT = 2045,
+  IDC_FMT_ALIGN_CENTER = 2046,
+  IDC_FMT_ALIGN_RIGHT = 2047,
+  IDC_FMT_INDENT_INC = 2048,
+  IDC_FMT_INDENT_DEC = 2049,
+  IDC_FMT_CLEAR = 2050,
 };
 
 struct AppState {
@@ -95,6 +111,17 @@ struct AppState {
   HWND lbl_status{};
   HWND lbl_title{};
   HWND lbl_body{};
+  HWND fmt_bold{};
+  HWND fmt_italic{};
+  HWND fmt_underline{};
+  HWND fmt_numbering{};
+  HWND fmt_bullet{};
+  HWND fmt_align_left{};
+  HWND fmt_align_center{};
+  HWND fmt_align_right{};
+  HWND fmt_indent_inc{};
+  HWND fmt_indent_dec{};
+  HWND fmt_clear{};
   HWND cb_category{};
   HWND ed_start{};
   HWND ed_end{};
@@ -119,6 +146,7 @@ struct AppState {
 };
 
 static bool IsEditorTrulyDirty(AppState* s);
+static void SetEditorDirty(AppState* s, bool dirty);
 
 static AppState* GetState(HWND hwnd) {
   return reinterpret_cast<AppState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -375,6 +403,34 @@ static void UpdateStatusBar(AppState* s) {
   if (IsEditorTrulyDirty(s)) info += L"  未保存";
   SendMessageW(s->status, SB_SETTEXTW, 0, (LPARAM)info.c_str());
 }
+
+static void ApplyBodyFormatting(AppState* s, void (*fn)(HWND)) {
+  if (!s || !s->ed_body || !fn) return;
+  // Ensure caret/selection state is owned by the RichEdit.
+  SetFocus(s->ed_body);
+  fn(s->ed_body);
+  SetEditorDirty(s, true);
+  SendMessageW(s->ed_body, EM_SETMODIFY, TRUE, 0);
+  UpdateStatusBar(s);
+}
+
+static void ApplyBodyFormatting2(AppState* s, void (*fn)(HWND, int), int arg) {
+  if (!s || !s->ed_body || !fn) return;
+  SetFocus(s->ed_body);
+  fn(s->ed_body, arg);
+  SetEditorDirty(s, true);
+  SendMessageW(s->ed_body, EM_SETMODIFY, TRUE, 0);
+  UpdateStatusBar(s);
+}
+
+static void BodyFmtBold(HWND rich) { RichToggleCharEffect(rich, CFE_BOLD); }
+static void BodyFmtItalic(HWND rich) { RichToggleCharEffect(rich, CFE_ITALIC); }
+static void BodyFmtUnderline(HWND rich) { RichToggleCharEffect(rich, CFE_UNDERLINE); }
+static void BodyFmtBullet(HWND rich) { RichToggleBullet(rich); }
+static void BodyFmtNumbering(HWND rich) { RichToggleNumbering(rich); }
+static void BodyFmtClear(HWND rich) { RichClearFormatting(rich); }
+static void BodyFmtIndent(HWND rich, int twips) { RichAdjustIndent(rich, twips); }
+static void BodyFmtAlign(HWND rich, int align) { RichSetParaAlignment(rich, (WORD)align); }
 
 static void UpdateStatusParts(AppState* s) {
   if (!s || !s->status) return;
@@ -888,6 +944,435 @@ static bool WriteUtf8FileWithBom(const std::wstring& path, const std::wstring& c
     return false;
   }
   return true;
+}
+
+static bool ReadFileUtf8Simple(const std::wstring& path, std::wstring* out, std::wstring* err) {
+  if (!out) return false;
+  out->clear();
+  FILE* f = nullptr;
+  _wfopen_s(&f, path.c_str(), L"rb");
+  if (!f) {
+    if (err) *err = L"无法读取文件: " + path;
+    return false;
+  }
+  fseek(f, 0, SEEK_END);
+  long size = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (size < 0) size = 0;
+  std::string bytes;
+  bytes.resize((size_t)size);
+  if (size > 0) {
+    size_t n = fread(bytes.data(), 1, (size_t)size, f);
+    bytes.resize(n);
+  }
+  fclose(f);
+
+  // Strip UTF-8 BOM if present.
+  if (bytes.size() >= 3 && (unsigned char)bytes[0] == 0xEF && (unsigned char)bytes[1] == 0xBB &&
+      (unsigned char)bytes[2] == 0xBF) {
+    bytes.erase(0, 3);
+  }
+  *out = Utf8ToWide(bytes);
+  return true;
+}
+
+static bool ParseKVLine(const std::wstring& line, std::wstring* out_k, std::wstring* out_v) {
+  size_t eq = line.find(L'=');
+  if (eq == std::wstring::npos) return false;
+  if (out_k) *out_k = line.substr(0, eq);
+  if (out_v) *out_v = line.substr(eq + 1);
+  return true;
+}
+
+struct AuthSettings {
+  bool enabled{false};
+  int iters{80000};
+  std::string salt;  // raw bytes
+  std::string hash;  // raw bytes
+};
+
+static std::wstring GetAuthFilePath() {
+  return JoinPath(GetDataRootDir(), L"auth.wla");
+}
+
+static bool AuthLoad(AuthSettings* out, std::wstring* err) {
+  if (!out) return false;
+  *out = AuthSettings{};
+
+  std::wstring path = GetAuthFilePath();
+  if (!FileExists(path)) return true;  // not enabled yet
+
+  std::wstring content;
+  if (!ReadFileUtf8Simple(path, &content, err)) return false;
+
+  std::wstringstream ss(content);
+  std::wstring line;
+  bool header_ok = false;
+  std::wstring salt_b64, hash_b64, iters_w;
+  while (std::getline(ss, line)) {
+    if (!line.empty() && line.back() == L'\r') line.pop_back();
+    if (line.empty()) continue;
+    if (!header_ok) {
+      header_ok = (line == L"WLA1");
+      continue;
+    }
+    std::wstring k, v;
+    if (!ParseKVLine(line, &k, &v)) continue;
+    if (k == L"iters") iters_w = v;
+    else if (k == L"salt_b64") salt_b64 = v;
+    else if (k == L"hash_b64") hash_b64 = v;
+  }
+  if (!header_ok) {
+    if (err) *err = L"密码文件格式错误: " + path;
+    return false;
+  }
+
+  int iters = _wtoi(iters_w.c_str());
+  if (iters <= 1000) iters = 80000;
+
+  std::string salt_bytes;
+  std::string hash_bytes;
+  if (!Base64Decode(WideToUtf8(salt_b64), &salt_bytes) || salt_bytes.empty()) {
+    if (err) *err = L"密码文件损坏(salt): " + path;
+    return false;
+  }
+  if (!Base64Decode(WideToUtf8(hash_b64), &hash_bytes) || hash_bytes.empty()) {
+    if (err) *err = L"密码文件损坏(hash): " + path;
+    return false;
+  }
+
+  out->enabled = true;
+  out->iters = iters;
+  out->salt = std::move(salt_bytes);
+  out->hash = std::move(hash_bytes);
+  return true;
+}
+
+static bool AuthSave(const AuthSettings& s, std::wstring* err) {
+  EnsureDirExists(GetDataRootDir());
+  std::wstring path = GetAuthFilePath();
+
+  std::wstring content;
+  content += L"WLA1\n";
+  content += L"iters=" + std::to_wstring(s.iters) + L"\n";
+  content += L"salt_b64=" + Utf8ToWide(Base64Encode(s.salt)) + L"\n";
+  content += L"hash_b64=" + Utf8ToWide(Base64Encode(s.hash)) + L"\n";
+  return WriteUtf8File(path, content, err);
+}
+
+static bool DerivePbkdf2Sha256(const std::string& password_utf8,
+                               const std::string& salt,
+                               int iters,
+                               std::string* out_key,
+                               std::wstring* err) {
+  if (!out_key) return false;
+  out_key->clear();
+  if (iters < 1000) iters = 1000;
+
+  BCRYPT_ALG_HANDLE hAlg = nullptr;
+  NTSTATUS st = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+  if (st != 0 || !hAlg) {
+    if (err) *err = L"无法初始化加密模块(BCryptOpenAlgorithmProvider)";
+    return false;
+  }
+  std::string key;
+  key.resize(32);
+  st = BCryptDeriveKeyPBKDF2(hAlg,
+                             (PUCHAR)password_utf8.data(), (ULONG)password_utf8.size(),
+                             (PUCHAR)salt.data(), (ULONG)salt.size(),
+                             (ULONGLONG)iters,
+                             (PUCHAR)key.data(), (ULONG)key.size(),
+                             0);
+  BCryptCloseAlgorithmProvider(hAlg, 0);
+  if (st != 0) {
+    if (err) *err = L"密码派生失败(BCryptDeriveKeyPBKDF2)";
+    return false;
+  }
+  *out_key = std::move(key);
+  return true;
+}
+
+static bool SecureEq(const std::string& a, const std::string& b) {
+  if (a.size() != b.size()) return false;
+  unsigned char x = 0;
+  for (size_t i = 0; i < a.size(); i++) x |= (unsigned char)(a[i] ^ b[i]);
+  return x == 0;
+}
+
+static bool AuthVerifyPassword(const AuthSettings& s, const std::wstring& password, std::wstring* err) {
+  if (!s.enabled) return true;
+  std::string pass = WideToUtf8(password);
+  std::string key;
+  if (!DerivePbkdf2Sha256(pass, s.salt, s.iters, &key, err)) return false;
+  if (!SecureEq(key, s.hash)) return false;
+  return true;
+}
+
+static bool AuthSetNewPassword(const std::wstring& new_password, std::wstring* err) {
+  AuthSettings s{};
+  s.enabled = true;
+  s.iters = 80000;
+
+  // 16-byte random salt.
+  std::string salt;
+  salt.resize(16);
+  NTSTATUS st = BCryptGenRandom(nullptr, (PUCHAR)salt.data(), (ULONG)salt.size(), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+  if (st != 0) {
+    if (err) *err = L"无法生成随机盐(BCryptGenRandom)";
+    return false;
+  }
+  s.salt = std::move(salt);
+
+  std::string key;
+  if (!DerivePbkdf2Sha256(WideToUtf8(new_password), s.salt, s.iters, &key, err)) return false;
+  s.hash = std::move(key);
+  return AuthSave(s, err);
+}
+
+struct PasswordWindowState {
+  HWND hwnd{};
+  HWND st_info{};
+  HWND st_p1{};
+  HWND st_p2{};
+  HWND ed_p1{};
+  HWND ed_p2{};
+  HWND btn_ok{};
+  HWND btn_cancel{};
+  HFONT font{};
+  bool is_setup{false};
+  bool ok{false};
+  std::wstring out_password;
+};
+
+static std::wstring GetEditText(HWND h) {
+  return GetWindowTextWString(h);
+}
+
+static void PwSetFocusAll(HWND h) {
+  SetFocus(h);
+  SendMessageW(h, EM_SETSEL, 0, -1);
+}
+
+static LRESULT CALLBACK PasswordWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+  auto* s = reinterpret_cast<PasswordWindowState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+  switch (msg) {
+    case WM_CREATE: {
+      auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+      s = reinterpret_cast<PasswordWindowState*>(cs->lpCreateParams);
+      s->hwnd = hwnd;
+      SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(s));
+      s->font = CreateUiFont(hwnd);
+
+      s->st_info = CreateWindowExW(0, L"STATIC", s->is_setup ? L"首次使用：请设置密码(至少 6 位)。" : L"请输入密码：",
+                                   WS_CHILD | WS_VISIBLE,
+                                   0, 0, 10, 10, hwnd, (HMENU)1, nullptr, nullptr);
+      s->st_p1 = CreateWindowExW(0, L"STATIC", s->is_setup ? L"新密码" : L"密码",
+                                 WS_CHILD | WS_VISIBLE,
+                                 0, 0, 10, 10, hwnd, (HMENU)2, nullptr, nullptr);
+      s->ed_p1 = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                 WS_CHILD | WS_VISIBLE | ES_PASSWORD | ES_AUTOHSCROLL | WS_TABSTOP,
+                                 0, 0, 10, 10, hwnd, (HMENU)3, nullptr, nullptr);
+
+      s->st_p2 = CreateWindowExW(0, L"STATIC", L"确认密码",
+                                 WS_CHILD | (s->is_setup ? WS_VISIBLE : 0),
+                                 0, 0, 10, 10, hwnd, (HMENU)4, nullptr, nullptr);
+      s->ed_p2 = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                 WS_CHILD | (s->is_setup ? WS_VISIBLE : 0) | ES_PASSWORD | ES_AUTOHSCROLL | WS_TABSTOP,
+                                 0, 0, 10, 10, hwnd, (HMENU)5, nullptr, nullptr);
+
+      s->btn_ok = CreateWindowExW(0, L"BUTTON", L"确定",
+                                  WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP,
+                                  0, 0, 10, 10, hwnd, (HMENU)6, nullptr, nullptr);
+      s->btn_cancel = CreateWindowExW(0, L"BUTTON", L"取消",
+                                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                      0, 0, 10, 10, hwnd, (HMENU)7, nullptr, nullptr);
+
+      for (HWND h : {s->st_info, s->st_p1, s->st_p2, s->ed_p1, s->ed_p2, s->btn_ok, s->btn_cancel}) {
+        if (!h) continue;
+        SetControlFont(h, s->font);
+      }
+      SetFocus(s->ed_p1);
+      return 0;
+    }
+    case WM_SIZE: {
+      int w = LOWORD(lParam);
+      int h = HIWORD(lParam);
+      int pad = ScalePx(hwnd, 12);
+      int row = ScalePx(hwnd, 26);
+      int lbl = ScalePx(hwnd, 18);
+      int btn_h = ScalePx(hwnd, 30);
+      int btn_w = ScalePx(hwnd, 90);
+
+      int x = pad;
+      int y = pad;
+      MoveWindow(s->st_info, x, y, w - 2 * pad, lbl, TRUE);
+      y += lbl + pad;
+
+      MoveWindow(s->st_p1, x, y, w - 2 * pad, lbl, TRUE);
+      y += lbl + ScalePx(hwnd, 2);
+      MoveWindow(s->ed_p1, x, y, w - 2 * pad, row, TRUE);
+      y += row + pad;
+
+      if (s->is_setup) {
+        ShowWindow(s->st_p2, SW_SHOW);
+        ShowWindow(s->ed_p2, SW_SHOW);
+        MoveWindow(s->st_p2, x, y, w - 2 * pad, lbl, TRUE);
+        y += lbl + ScalePx(hwnd, 2);
+        MoveWindow(s->ed_p2, x, y, w - 2 * pad, row, TRUE);
+        y += row + pad;
+      } else {
+        ShowWindow(s->st_p2, SW_HIDE);
+        ShowWindow(s->ed_p2, SW_HIDE);
+      }
+
+      int y_btn = h - pad - btn_h;
+      MoveWindow(s->btn_cancel, w - pad - btn_w, y_btn, btn_w, btn_h, TRUE);
+      MoveWindow(s->btn_ok, w - pad * 2 - btn_w * 2, y_btn, btn_w, btn_h, TRUE);
+      return 0;
+    }
+    case WM_COMMAND: {
+      int id = LOWORD(wParam);
+      if (id == 6) {  // OK
+        std::wstring p1 = GetEditText(s->ed_p1);
+        std::wstring p2 = s->is_setup ? GetEditText(s->ed_p2) : p1;
+        if ((int)p1.size() < 6) {
+          ShowInfoBox(hwnd, L"密码至少 6 位。", L"提示");
+          PwSetFocusAll(s->ed_p1);
+          return 0;
+        }
+        if (s->is_setup && p1 != p2) {
+          ShowInfoBox(hwnd, L"两次密码不一致。", L"提示");
+          PwSetFocusAll(s->ed_p2);
+          return 0;
+        }
+        s->out_password = p1;
+        s->ok = true;
+        DestroyWindow(hwnd);
+        return 0;
+      }
+      if (id == 7) {  // Cancel
+        DestroyWindow(hwnd);
+        return 0;
+      }
+      return 0;
+    }
+    case WM_CLOSE: {
+      DestroyWindow(hwnd);
+      return 0;
+    }
+    case WM_DESTROY: {
+      if (s && s->font) DeleteObject(s->font);
+      return 0;
+    }
+  }
+  return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static bool PromptPassword(HWND owner, bool is_setup, std::wstring* out_password) {
+  WNDCLASSW wc{};
+  wc.lpfnWndProc = PasswordWndProc;
+  wc.hInstance = GetModuleHandleW(nullptr);
+  wc.lpszClassName = L"WorkLogLitePasswordWnd";
+  wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+  wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+  RegisterClassW(&wc);
+
+  PasswordWindowState state{};
+  state.is_setup = is_setup;
+
+  HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, wc.lpszClassName, is_setup ? L"设置密码" : L"输入密码",
+                              WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 520, is_setup ? 320 : 260,
+                              owner, nullptr, wc.hInstance, &state);
+  if (!hwnd) return false;
+
+  EnableWindow(owner, FALSE);
+  while (IsWindow(hwnd)) {
+    MSG msg{};
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+      if (msg.message == WM_QUIT) {
+        PostQuitMessage((int)msg.wParam);
+        EnableWindow(owner, TRUE);
+        return false;
+      }
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
+    WaitMessage();
+  }
+  EnableWindow(owner, TRUE);
+  SetForegroundWindow(owner);
+
+  if (state.ok && out_password) *out_password = state.out_password;
+  return state.ok;
+}
+
+static bool EnsureAuthenticated(HWND owner) {
+  std::wstring err;
+  AuthSettings s{};
+  if (!AuthLoad(&s, &err)) {
+    ShowInfoBox(owner, err.c_str(), L"读取密码失败");
+    return false;
+  }
+
+  if (!s.enabled) {
+    std::wstring pw;
+    if (!PromptPassword(owner, true, &pw)) return false;
+    std::wstring serr;
+    if (!AuthSetNewPassword(pw, &serr)) {
+      ShowInfoBox(owner, serr.c_str(), L"设置失败");
+      return false;
+    }
+    ShowInfoBox(owner, L"密码已设置。下次启动需要输入密码。", L"提示");
+    return true;
+  }
+
+  for (;;) {
+    std::wstring pw;
+    if (!PromptPassword(owner, false, &pw)) return false;
+    std::wstring verr;
+    bool ok = AuthVerifyPassword(s, pw, &verr);
+    if (!verr.empty() && !ok) {
+      ShowInfoBox(owner, verr.c_str(), L"验证失败");
+      continue;
+    }
+    if (ok) return true;
+    ShowInfoBox(owner, L"密码错误。", L"提示");
+  }
+}
+
+static void ChangePasswordFlow(HWND owner) {
+  std::wstring err;
+  AuthSettings s{};
+  if (!AuthLoad(&s, &err)) {
+    ShowInfoBox(owner, err.c_str(), L"读取密码失败");
+    return;
+  }
+  if (!s.enabled) {
+    ShowInfoBox(owner, L"当前未设置密码，将直接进入设置流程。", L"提示");
+  } else {
+    for (;;) {
+      std::wstring cur;
+      if (!PromptPassword(owner, false, &cur)) return;
+      std::wstring verr;
+      bool ok = AuthVerifyPassword(s, cur, &verr);
+      if (!verr.empty() && !ok) {
+        ShowInfoBox(owner, verr.c_str(), L"验证失败");
+        continue;
+      }
+      if (ok) break;
+      ShowInfoBox(owner, L"当前密码错误。", L"提示");
+    }
+  }
+
+  std::wstring npw;
+  if (!PromptPassword(owner, true, &npw)) return;
+  std::wstring serr;
+  if (!AuthSetNewPassword(npw, &serr)) {
+    ShowInfoBox(owner, serr.c_str(), L"修改失败");
+    return;
+  }
+  ShowInfoBox(owner, L"密码已修改。", L"提示");
 }
 
 static bool CopyToClipboard(HWND hwnd, const std::wstring& text) {
@@ -1475,6 +1960,7 @@ static void ShowHelp(AppState* s) {
       L"- 周期会议: 工具 -> 管理周期会议。可设置会议模板，打开当天会自动填入。\n"
       L"- 从会议创建任务: 在会议条目上右键 -> 从此会议创建长期任务。\n"
       L"- 演示数据: 工具 -> 生成示例数据(演示)。\n"
+      L"- 密码: 工具 -> 修改密码。若忘记密码，可删除数据目录下的 auth.wla 重置。\n"
       L"\n"
       L"快捷键:\n"
       L"- Ctrl+S 保存\n"
@@ -2831,6 +3317,22 @@ static void Layout(AppState* s) {
 
   MoveWindow(s->lbl_body, right_x, y, right_w, lbl_h, TRUE);
   y += lbl_h + ScalePx(s->hwnd, 2);
+
+  // Formatting toolbar row (compact).
+  int tbh = ScalePx(s->hwnd, 26);
+  int tbw = ScalePx(s->hwnd, 30);
+  int tb_pad = ScalePx(s->hwnd, 6);
+  int tx = right_x;
+  int ty = y;
+  for (HWND b : {s->fmt_bold, s->fmt_italic, s->fmt_underline, s->fmt_numbering, s->fmt_bullet,
+                 s->fmt_align_left, s->fmt_align_center, s->fmt_align_right,
+                 s->fmt_indent_dec, s->fmt_indent_inc, s->fmt_clear}) {
+    if (!b) continue;
+    MoveWindow(b, tx, ty, tbw, tbh, TRUE);
+    tx += tbw + tb_pad;
+  }
+  y += tbh + ScalePx(s->hwnd, 4);
+
   MoveWindow(s->ed_body, right_x, y, right_w, h - y - pad, TRUE);
 }
 
@@ -2903,6 +3405,7 @@ static HMENU CreateAppMenu() {
   AppendMenuW(tools, MF_STRING, IDM_MANAGE_RECURRING_MEETINGS, L"管理周期会议...\tCtrl+R");
   AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(tools, MF_STRING, IDM_GENERATE_DEMO_DATA, L"生成示例数据(演示)...");
+  AppendMenuW(tools, MF_STRING, IDM_CHANGE_PASSWORD, L"修改密码...");
   AppendMenuW(menu, MF_POPUP, (UINT_PTR)tools, L"工具");
 
   HMENU help = CreateMenu();
@@ -2989,6 +3492,42 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       s->lbl_body = CreateWindowExW(0, L"STATIC", L"内容(富文本)",
                                     WS_CHILD | WS_VISIBLE,
                                     0, 0, 10, 10, hwnd, (HMENU)IDC_LBL_BODY, nullptr, nullptr);
+
+      // Formatting toolbar (kept right above the body to make formatting discoverable).
+      s->fmt_bold = CreateWindowExW(0, L"BUTTON", L"B",
+                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                    0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_BOLD, nullptr, nullptr);
+      s->fmt_italic = CreateWindowExW(0, L"BUTTON", L"I",
+                                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                      0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_ITALIC, nullptr, nullptr);
+      s->fmt_underline = CreateWindowExW(0, L"BUTTON", L"U",
+                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                         0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_UNDERLINE, nullptr, nullptr);
+      s->fmt_numbering = CreateWindowExW(0, L"BUTTON", L"1.",
+                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                         0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_NUMBERING, nullptr, nullptr);
+      s->fmt_bullet = CreateWindowExW(0, L"BUTTON", L"•",
+                                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                      0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_BULLET, nullptr, nullptr);
+      s->fmt_align_left = CreateWindowExW(0, L"BUTTON", L"L",
+                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                          0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_ALIGN_LEFT, nullptr, nullptr);
+      s->fmt_align_center = CreateWindowExW(0, L"BUTTON", L"C",
+                                            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                            0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_ALIGN_CENTER, nullptr, nullptr);
+      s->fmt_align_right = CreateWindowExW(0, L"BUTTON", L"R",
+                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                           0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_ALIGN_RIGHT, nullptr, nullptr);
+      s->fmt_indent_inc = CreateWindowExW(0, L"BUTTON", L">",
+                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                          0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_INDENT_INC, nullptr, nullptr);
+      s->fmt_indent_dec = CreateWindowExW(0, L"BUTTON", L"<",
+                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                          0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_INDENT_DEC, nullptr, nullptr);
+      s->fmt_clear = CreateWindowExW(0, L"BUTTON", L"清",
+                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                     0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_CLEAR, nullptr, nullptr);
+
       s->ed_body = CreateWindowExW(WS_EX_CLIENTEDGE, L"RICHEDIT50W", L"",
                                    WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_DISABLENOSCROLL | ES_NOHIDESEL |
                                        WS_VSCROLL | WS_TABSTOP,
@@ -3013,12 +3552,22 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
       // Fonts
       for (HWND h : {s->cal, s->st_day, s->list, s->lbl_category, s->lbl_start, s->lbl_end, s->lbl_title, s->lbl_body,
-                     s->lbl_status, s->cb_category, s->ed_start, s->ed_end, s->cb_status, s->ed_title, s->ed_body, s->status,
+                     s->lbl_status, s->cb_category, s->ed_start, s->ed_end, s->cb_status, s->ed_title,
+                     s->fmt_bold, s->fmt_italic, s->fmt_underline, s->fmt_numbering, s->fmt_bullet,
+                     s->fmt_align_left, s->fmt_align_center, s->fmt_align_right, s->fmt_indent_inc, s->fmt_indent_dec, s->fmt_clear,
+                     s->ed_body, s->status,
                      s->btn_new, s->btn_save, s->btn_preview, s->btn_del}) {
         SetControlFont(h, s->font);
       }
 
       SetMenu(hwnd, CreateAppMenu());
+
+      // Password gate (offline, local). First run will require setting a password.
+      // NOTE: This is not data encryption; it is an access gate for the UI.
+      if (!EnsureAuthenticated(hwnd)) {
+        DestroyWindow(hwnd);
+        return 0;
+      }
 
       // Load categories
       {
@@ -3091,6 +3640,53 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
       }
 
+      if (code == BN_CLICKED) {
+        if (id == IDC_FMT_BOLD) {
+          ApplyBodyFormatting(s, BodyFmtBold);
+          return 0;
+        }
+        if (id == IDC_FMT_ITALIC) {
+          ApplyBodyFormatting(s, BodyFmtItalic);
+          return 0;
+        }
+        if (id == IDC_FMT_UNDERLINE) {
+          ApplyBodyFormatting(s, BodyFmtUnderline);
+          return 0;
+        }
+        if (id == IDC_FMT_NUMBERING) {
+          ApplyBodyFormatting(s, BodyFmtNumbering);
+          return 0;
+        }
+        if (id == IDC_FMT_BULLET) {
+          ApplyBodyFormatting(s, BodyFmtBullet);
+          return 0;
+        }
+        if (id == IDC_FMT_ALIGN_LEFT) {
+          ApplyBodyFormatting2(s, BodyFmtAlign, (int)PFA_LEFT);
+          return 0;
+        }
+        if (id == IDC_FMT_ALIGN_CENTER) {
+          ApplyBodyFormatting2(s, BodyFmtAlign, (int)PFA_CENTER);
+          return 0;
+        }
+        if (id == IDC_FMT_ALIGN_RIGHT) {
+          ApplyBodyFormatting2(s, BodyFmtAlign, (int)PFA_RIGHT);
+          return 0;
+        }
+        if (id == IDC_FMT_INDENT_INC) {
+          ApplyBodyFormatting2(s, BodyFmtIndent, 360);
+          return 0;
+        }
+        if (id == IDC_FMT_INDENT_DEC) {
+          ApplyBodyFormatting2(s, BodyFmtIndent, -360);
+          return 0;
+        }
+        if (id == IDC_FMT_CLEAR) {
+          ApplyBodyFormatting(s, BodyFmtClear);
+          return 0;
+        }
+      }
+
       if ((id == IDC_CATEGORY || id == IDC_START || id == IDC_END || id == IDC_CB_STATUS || id == IDC_TITLE || id == IDC_BODY) &&
           (code == CBN_SELCHANGE || code == EN_CHANGE)) {
         SetEditorDirty(s, true);
@@ -3131,102 +3727,47 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
       }
       if (id == IDM_FMT_BOLD) {
-        if (GetFocus() == s->ed_body) {
-          RichToggleCharEffect(s->ed_body, CFE_BOLD);
-          SetEditorDirty(s, true);
-          SendMessageW(s->ed_body, EM_SETMODIFY, TRUE, 0);
-          UpdateStatusBar(s);
-        }
+        ApplyBodyFormatting(s, BodyFmtBold);
         return 0;
       }
       if (id == IDM_FMT_ITALIC) {
-        if (GetFocus() == s->ed_body) {
-          RichToggleCharEffect(s->ed_body, CFE_ITALIC);
-          SetEditorDirty(s, true);
-          SendMessageW(s->ed_body, EM_SETMODIFY, TRUE, 0);
-          UpdateStatusBar(s);
-        }
+        ApplyBodyFormatting(s, BodyFmtItalic);
         return 0;
       }
       if (id == IDM_FMT_UNDERLINE) {
-        if (GetFocus() == s->ed_body) {
-          RichToggleCharEffect(s->ed_body, CFE_UNDERLINE);
-          SetEditorDirty(s, true);
-          SendMessageW(s->ed_body, EM_SETMODIFY, TRUE, 0);
-          UpdateStatusBar(s);
-        }
+        ApplyBodyFormatting(s, BodyFmtUnderline);
         return 0;
       }
       if (id == IDM_FMT_BULLET) {
-        if (GetFocus() == s->ed_body) {
-          RichToggleBullet(s->ed_body);
-          SetEditorDirty(s, true);
-          SendMessageW(s->ed_body, EM_SETMODIFY, TRUE, 0);
-          UpdateStatusBar(s);
-        }
+        ApplyBodyFormatting(s, BodyFmtBullet);
         return 0;
       }
       if (id == IDM_FMT_NUMBERING) {
-        if (GetFocus() == s->ed_body) {
-          RichToggleNumbering(s->ed_body);
-          SetEditorDirty(s, true);
-          SendMessageW(s->ed_body, EM_SETMODIFY, TRUE, 0);
-          UpdateStatusBar(s);
-        }
+        ApplyBodyFormatting(s, BodyFmtNumbering);
         return 0;
       }
       if (id == IDM_FMT_ALIGN_LEFT) {
-        if (GetFocus() == s->ed_body) {
-          RichSetParaAlignment(s->ed_body, PFA_LEFT);
-          SetEditorDirty(s, true);
-          SendMessageW(s->ed_body, EM_SETMODIFY, TRUE, 0);
-          UpdateStatusBar(s);
-        }
+        ApplyBodyFormatting2(s, BodyFmtAlign, (int)PFA_LEFT);
         return 0;
       }
       if (id == IDM_FMT_ALIGN_CENTER) {
-        if (GetFocus() == s->ed_body) {
-          RichSetParaAlignment(s->ed_body, PFA_CENTER);
-          SetEditorDirty(s, true);
-          SendMessageW(s->ed_body, EM_SETMODIFY, TRUE, 0);
-          UpdateStatusBar(s);
-        }
+        ApplyBodyFormatting2(s, BodyFmtAlign, (int)PFA_CENTER);
         return 0;
       }
       if (id == IDM_FMT_ALIGN_RIGHT) {
-        if (GetFocus() == s->ed_body) {
-          RichSetParaAlignment(s->ed_body, PFA_RIGHT);
-          SetEditorDirty(s, true);
-          SendMessageW(s->ed_body, EM_SETMODIFY, TRUE, 0);
-          UpdateStatusBar(s);
-        }
+        ApplyBodyFormatting2(s, BodyFmtAlign, (int)PFA_RIGHT);
         return 0;
       }
       if (id == IDM_FMT_INDENT_INC) {
-        if (GetFocus() == s->ed_body) {
-          RichAdjustIndent(s->ed_body, 360);
-          SetEditorDirty(s, true);
-          SendMessageW(s->ed_body, EM_SETMODIFY, TRUE, 0);
-          UpdateStatusBar(s);
-        }
+        ApplyBodyFormatting2(s, BodyFmtIndent, 360);
         return 0;
       }
       if (id == IDM_FMT_INDENT_DEC) {
-        if (GetFocus() == s->ed_body) {
-          RichAdjustIndent(s->ed_body, -360);
-          SetEditorDirty(s, true);
-          SendMessageW(s->ed_body, EM_SETMODIFY, TRUE, 0);
-          UpdateStatusBar(s);
-        }
+        ApplyBodyFormatting2(s, BodyFmtIndent, -360);
         return 0;
       }
       if (id == IDM_FMT_CLEAR) {
-        if (GetFocus() == s->ed_body) {
-          RichClearFormatting(s->ed_body);
-          SetEditorDirty(s, true);
-          SendMessageW(s->ed_body, EM_SETMODIFY, TRUE, 0);
-          UpdateStatusBar(s);
-        }
+        ApplyBodyFormatting(s, BodyFmtClear);
         return 0;
       }
       if (id == IDM_OPEN_DATA_DIR) {
@@ -3315,6 +3856,11 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         }
         LoadSelectedDay(s, s->selected);
         ShowInfoBox(hwnd, L"已生成示例数据。建议打开“本季度(按分类)”查看汇总效果。", L"完成");
+        return 0;
+      }
+      if (id == IDM_CHANGE_PASSWORD) {
+        if (!PromptSaveIfDirty(s)) return 0;
+        ChangePasswordFlow(hwnd);
         return 0;
       }
       if (id == IDM_HELP) {

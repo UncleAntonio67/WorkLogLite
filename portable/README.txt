@@ -37,5 +37,6 @@ Shortcuts:
 - Ctrl+K Manage categories
 - Ctrl+T Manage long-term tasks
 - Report -> Export quarter/year CSV
+- Tools -> Change password
 - Delete Delete entry
 - F1 Help

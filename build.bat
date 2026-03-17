@@ -59,7 +59,7 @@ cl ^
   /W4 /wd4100 /wd4505 ^
   /Fe:build\WorkLogLite.new.exe ^
   %SOURCES% ^
-  user32.lib gdi32.lib comctl32.lib comdlg32.lib shlwapi.lib ole32.lib shell32.lib crypt32.lib
+  user32.lib gdi32.lib comctl32.lib comdlg32.lib shlwapi.lib ole32.lib shell32.lib crypt32.lib bcrypt.lib
 
 if errorlevel 1 (
   echo.

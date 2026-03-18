@@ -10,6 +10,7 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <richedit.h>
+#include <shobjidl.h>
 #include <shellapi.h>
 #include <windowsx.h>
 #include <bcrypt.h>
@@ -38,12 +39,16 @@ enum : UINT {
   IDM_EXPORT_YEAR_CSV = 1006,
   IDM_OPEN_DATA_DIR = 1010,
   IDM_MANAGE_CATEGORIES = 1011,
+  IDM_EXPORT_FULL_DATA = 1012,
+  IDM_IMPORT_FULL_DATA = 1013,
+  IDM_CLEAR_ALL_DATA = 1014,
   IDM_PREVIEW_ENTRY = 1020,
   IDM_PREVIEW_DAY = 1021,
   IDM_MANAGE_TASKS = 1030,
   IDM_MANAGE_RECURRING_MEETINGS = 1040,
   IDM_GENERATE_DEMO_DATA = 1050,
   IDM_CHANGE_PASSWORD = 1060,
+  IDM_DISABLE_PASSWORD_LOGIN = 1061,
   IDM_HELP = 1100,
 
   // Context menu (ListView)
@@ -139,6 +144,7 @@ struct AppState {
   DayData day{};
   int editing_index{-1};  // -1 => new entry
   bool editor_dirty{false};
+  bool ignore_cal_selchange{false};  // avoid repeated prompts when we programmatically revert calendar selection
 
   std::vector<std::wstring> categories;
   std::vector<Task> tasks;
@@ -891,12 +897,27 @@ static void DeleteCurrent(AppState* s) {
   ClearEditor(s);
 }
 
+static void DiscardEditorChanges(AppState* s) {
+  if (!s) return;
+  // Restore editor UI to match persisted model, so user choosing "No" won't keep a dirty editor
+  // and trigger the same prompt repeatedly on the next navigation.
+  if (s->editing_index >= 0 && s->editing_index < (int)s->day.entries.size()) {
+    FillEditorFromEntry(s, s->day.entries[(size_t)s->editing_index], s->editing_index);
+  } else {
+    ClearEditor(s);
+  }
+  SetEditorDirty(s, false);
+  if (s->ed_title) SendMessageW(s->ed_title, EM_SETMODIFY, FALSE, 0);
+  if (s->ed_body) SendMessageW(s->ed_body, EM_SETMODIFY, FALSE, 0);
+  UpdateStatusBar(s);
+}
+
 static bool PromptSaveIfDirty(AppState* s) {
   if (!IsEditorTrulyDirty(s)) return true;
   int r = MessageBoxW(s->hwnd, L"当前编辑尚未保存。是否保存？", kAppTitle, MB_YESNOCANCEL | MB_ICONWARNING);
   if (r == IDCANCEL) return false;
   if (r == IDNO) {
-    SetEditorDirty(s, false);
+    DiscardEditorChanges(s);
     return true;
   }
   return SaveCurrent(s);
@@ -985,6 +1006,9 @@ static bool ParseKVLine(const std::wstring& line, std::wstring* out_k, std::wstr
 }
 
 struct AuthSettings {
+  // configured: whether auth.wla exists and was successfully parsed.
+  // enabled: whether password prompt is required on startup.
+  bool configured{false};
   bool enabled{false};
   int iters{80000};
   std::string salt;  // raw bytes
@@ -1000,7 +1024,7 @@ static bool AuthLoad(AuthSettings* out, std::wstring* err) {
   *out = AuthSettings{};
 
   std::wstring path = GetAuthFilePath();
-  if (!FileExists(path)) return true;  // not enabled yet
+  if (!FileExists(path)) return true;  // not configured yet
 
   std::wstring content;
   if (!ReadFileUtf8Simple(path, &content, err)) return false;
@@ -1008,23 +1032,40 @@ static bool AuthLoad(AuthSettings* out, std::wstring* err) {
   std::wstringstream ss(content);
   std::wstring line;
   bool header_ok = false;
-  std::wstring salt_b64, hash_b64, iters_w;
+  int version = 0;
+  std::wstring enabled_w, salt_b64, hash_b64, iters_w;
   while (std::getline(ss, line)) {
     if (!line.empty() && line.back() == L'\r') line.pop_back();
     if (line.empty()) continue;
     if (!header_ok) {
-      header_ok = (line == L"WLA1");
+      if (line == L"WLA1") { header_ok = true; version = 1; }
+      else if (line == L"WLA2") { header_ok = true; version = 2; }
       continue;
     }
     std::wstring k, v;
     if (!ParseKVLine(line, &k, &v)) continue;
-    if (k == L"iters") iters_w = v;
+    if (k == L"enabled") enabled_w = v;
+    else if (k == L"iters") iters_w = v;
     else if (k == L"salt_b64") salt_b64 = v;
     else if (k == L"hash_b64") hash_b64 = v;
   }
   if (!header_ok) {
     if (err) *err = L"密码文件格式错误: " + path;
     return false;
+  }
+
+  out->configured = true;
+
+  // WLA2 supports explicit disable: enabled=0 means "skip password prompt on startup".
+  if (version >= 2) {
+    int enabled_i = _wtoi(enabled_w.c_str());
+    if (enabled_i == 0) {
+      out->enabled = false;
+      out->iters = 0;
+      out->salt.clear();
+      out->hash.clear();
+      return true;
+    }
   }
 
   int iters = _wtoi(iters_w.c_str());
@@ -1053,7 +1094,9 @@ static bool AuthSave(const AuthSettings& s, std::wstring* err) {
   std::wstring path = GetAuthFilePath();
 
   std::wstring content;
-  content += L"WLA1\n";
+  // WLA2: explicit enabled flag for "disable password login".
+  content += L"WLA2\n";
+  content += L"enabled=" + std::to_wstring(s.enabled ? 1 : 0) + L"\n";
   content += L"iters=" + std::to_wstring(s.iters) + L"\n";
   content += L"salt_b64=" + Utf8ToWide(Base64Encode(s.salt)) + L"\n";
   content += L"hash_b64=" + Utf8ToWide(Base64Encode(s.hash)) + L"\n";
@@ -1070,7 +1113,8 @@ static bool DerivePbkdf2Sha256(const std::string& password_utf8,
   if (iters < 1000) iters = 1000;
 
   BCRYPT_ALG_HANDLE hAlg = nullptr;
-  NTSTATUS st = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+  // BCryptDeriveKeyPBKDF2 expects an HMAC-capable algorithm handle (PRF).
+  NTSTATUS st = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
   if (st != 0 || !hAlg) {
     if (err) *err = L"无法初始化加密模块(BCryptOpenAlgorithmProvider)";
     return false;
@@ -1110,6 +1154,7 @@ static bool AuthVerifyPassword(const AuthSettings& s, const std::wstring& passwo
 
 static bool AuthSetNewPassword(const std::wstring& new_password, std::wstring* err) {
   AuthSettings s{};
+  s.configured = true;
   s.enabled = true;
   s.iters = 80000;
 
@@ -1126,6 +1171,16 @@ static bool AuthSetNewPassword(const std::wstring& new_password, std::wstring* e
   std::string key;
   if (!DerivePbkdf2Sha256(WideToUtf8(new_password), s.salt, s.iters, &key, err)) return false;
   s.hash = std::move(key);
+  return AuthSave(s, err);
+}
+
+static bool AuthDisablePasswordLogin(std::wstring* err) {
+  AuthSettings s{};
+  s.configured = true;
+  s.enabled = false;
+  s.iters = 0;
+  s.salt.clear();
+  s.hash.clear();
   return AuthSave(s, err);
 }
 
@@ -1315,7 +1370,8 @@ static bool EnsureAuthenticated(HWND owner) {
     return false;
   }
 
-  if (!s.enabled) {
+  // Not configured yet: first run, require setting a password by default.
+  if (!s.configured) {
     std::wstring pw;
     if (!PromptPassword(owner, true, &pw)) return false;
     std::wstring serr;
@@ -1326,6 +1382,9 @@ static bool EnsureAuthenticated(HWND owner) {
     ShowInfoBox(owner, L"密码已设置。下次启动需要输入密码。", L"提示");
     return true;
   }
+
+  // Explicitly disabled: skip login prompt entirely.
+  if (!s.enabled) return true;
 
   for (;;) {
     std::wstring pw;
@@ -1375,6 +1434,53 @@ static void ChangePasswordFlow(HWND owner) {
   ShowInfoBox(owner, L"密码已修改。", L"提示");
 }
 
+static void DisablePasswordLoginFlow(HWND owner) {
+  std::wstring err;
+  AuthSettings s{};
+  if (!AuthLoad(&s, &err)) {
+    ShowInfoBox(owner, err.c_str(), L"读取密码失败");
+    return;
+  }
+
+  if (!s.configured) {
+    ShowInfoBox(owner, L"当前尚未设置密码，不需要取消密码登录。", L"提示");
+    return;
+  }
+  if (!s.enabled) {
+    ShowInfoBox(owner, L"当前已取消密码登录。", L"提示");
+    return;
+  }
+
+  // Security: require current password before allowing disabling login gate.
+  for (;;) {
+    std::wstring pw;
+    if (!PromptPassword(owner, false, &pw)) return;
+    std::wstring verr;
+    bool ok = AuthVerifyPassword(s, pw, &verr);
+    if (!verr.empty() && !ok) {
+      ShowInfoBox(owner, verr.c_str(), L"验证失败");
+      continue;
+    }
+    if (ok) break;
+    ShowInfoBox(owner, L"密码错误。", L"提示");
+  }
+
+  int r = MessageBoxW(owner,
+                      L"即将取消密码登录。\n\n"
+                      L"- 下次启动将不再要求输入密码\n"
+                      L"- 注意：这不会加密数据文件，取消后任何能访问本机文件的人都能直接读取 data 目录\n\n"
+                      L"确定继续？",
+                      kAppTitle, MB_YESNO | MB_ICONWARNING);
+  if (r != IDYES) return;
+
+  std::wstring serr;
+  if (!AuthDisablePasswordLogin(&serr)) {
+    ShowInfoBox(owner, serr.c_str(), L"取消失败");
+    return;
+  }
+  ShowInfoBox(owner, L"已取消密码登录。\n如需重新启用，可通过“工具 -> 修改密码...”重新设置密码。", L"完成");
+}
+
 static bool CopyToClipboard(HWND hwnd, const std::wstring& text) {
   if (!OpenClipboard(hwnd)) return false;
   EmptyClipboard();
@@ -1390,6 +1496,18 @@ static bool CopyToClipboard(HWND hwnd, const std::wstring& text) {
   SetClipboardData(CF_UNICODETEXT, h);
   CloseClipboard();
   return true;
+}
+
+static HMODULE TryLoadRichEditMsftedit() {
+  // Security hardening: remove current directory from DLL search path (mitigates DLL hijacking).
+  // This is a process-wide setting and is safe for this app (we only load system DLLs).
+  SetDllDirectoryW(L"");
+
+  // Prefer loading msftedit from System32 when supported, fallback to default behavior otherwise.
+  const DWORD kLoadSystem32 = 0x00000800;  // LOAD_LIBRARY_SEARCH_SYSTEM32
+  HMODULE h = LoadLibraryExW(L"Msftedit.dll", nullptr, kLoadSystem32);
+  if (h) return h;
+  return LoadLibraryW(L"Msftedit.dll");
 }
 
 static Entry GetEditorEntrySnapshot(AppState* s) {
@@ -1489,6 +1607,423 @@ static bool SaveCsvFileDialog(HWND owner, const std::wstring& default_name, std:
   if (!GetSaveFileNameW(&ofn)) return false;
   if (out_path) *out_path = std::wstring(buf);
   return true;
+}
+
+static std::wstring NowTimestampCompact() {
+  SYSTEMTIME st{};
+  GetLocalTime(&st);
+  wchar_t buf[64]{};
+  wsprintfW(buf, L"%04d%02d%02d_%02d%02d%02d",
+            (int)st.wYear, (int)st.wMonth, (int)st.wDay, (int)st.wHour, (int)st.wMinute, (int)st.wSecond);
+  return std::wstring(buf);
+}
+
+static std::wstring ParentDirOf(const std::wstring& path) {
+  if (path.empty()) return L"";
+  std::wstring p = path;
+  while (!p.empty() && (p.back() == L'\\' || p.back() == L'/')) p.pop_back();
+  size_t pos = p.find_last_of(L"\\/");
+  if (pos == std::wstring::npos) return L"";
+  return p.substr(0, pos);
+}
+
+static bool DirExistsW(const std::wstring& path) {
+  DWORD attr = GetFileAttributesW(path.c_str());
+  return (attr != INVALID_FILE_ATTRIBUTES) && ((attr & FILE_ATTRIBUTE_DIRECTORY) != 0);
+}
+
+static bool IsUncPath(const std::wstring& path) {
+  return path.size() >= 2 && ((path[0] == L'\\' && path[1] == L'\\') || (path[0] == L'/' && path[1] == L'/'));
+}
+
+static std::wstring NormalizeDirForCompare(const std::wstring& in) {
+  // Minimal normalization for "is child" checks: trim trailing slashes and lowercase ASCII.
+  std::wstring p = in;
+  while (!p.empty() && (p.back() == L'\\' || p.back() == L'/')) p.pop_back();
+  for (auto& ch : p) {
+    if (ch >= L'A' && ch <= L'Z') ch = (wchar_t)(ch - L'A' + L'a');
+    if (ch == L'/') ch = L'\\';
+  }
+  return p;
+}
+
+static bool IsSameOrChildDir(const std::wstring& parent, const std::wstring& child) {
+  std::wstring p = NormalizeDirForCompare(parent);
+  std::wstring c = NormalizeDirForCompare(child);
+  if (p.empty() || c.empty()) return false;
+  if (c == p) return true;
+  if (c.size() <= p.size()) return false;
+  if (c.compare(0, p.size(), p) != 0) return false;
+  return c[p.size()] == L'\\';
+}
+
+static std::wstring JoinPathLoose(const std::wstring& a, const std::wstring& b) {
+  // Avoid MAX_PATH pitfalls from PathCombine; JoinPath in win32_util uses it and can truncate for deep trees.
+  if (a.empty()) return b;
+  if (b.empty()) return a;
+  if (a.back() == L'\\' || a.back() == L'/') return a + b;
+  return a + L"\\" + b;
+}
+
+static std::wstring FormatWin32ErrorMessage(DWORD err) {
+  wchar_t* buf = nullptr;
+  DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
+  DWORD len = FormatMessageW(flags, nullptr, err, 0, (LPWSTR)&buf, 0, nullptr);
+  std::wstring msg;
+  if (len && buf) msg.assign(buf, buf + len);
+  if (buf) LocalFree(buf);
+  // Trim trailing newlines
+  while (!msg.empty() && (msg.back() == L'\r' || msg.back() == L'\n')) msg.pop_back();
+  return msg;
+}
+
+static bool PickFolderDialog(HWND owner, const wchar_t* title, std::wstring* out_path) {
+  if (out_path) out_path->clear();
+
+  HRESULT hr_init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+  bool do_uninit = SUCCEEDED(hr_init);
+
+  IFileDialog* dlg = nullptr;
+  HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
+  if (FAILED(hr) || !dlg) {
+    if (do_uninit) CoUninitialize();
+    return false;
+  }
+
+  DWORD opts = 0;
+  dlg->GetOptions(&opts);
+  dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+  if (title) dlg->SetTitle(title);
+
+  hr = dlg->Show(owner);
+  if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+    dlg->Release();
+    if (do_uninit) CoUninitialize();
+    return false;
+  }
+  if (FAILED(hr)) {
+    dlg->Release();
+    if (do_uninit) CoUninitialize();
+    return false;
+  }
+
+  IShellItem* item = nullptr;
+  hr = dlg->GetResult(&item);
+  if (FAILED(hr) || !item) {
+    dlg->Release();
+    if (do_uninit) CoUninitialize();
+    return false;
+  }
+
+  PWSTR psz = nullptr;
+  hr = item->GetDisplayName(SIGDN_FILESYSPATH, &psz);
+  if (SUCCEEDED(hr) && psz && out_path) *out_path = psz;
+  if (psz) CoTaskMemFree(psz);
+
+  item->Release();
+  dlg->Release();
+  if (do_uninit) CoUninitialize();
+  return out_path && !out_path->empty();
+}
+
+static bool CopyDirRecursive(const std::wstring& src_dir, const std::wstring& dst_dir, std::wstring* err) {
+  if (err) err->clear();
+  if (!DirExistsW(src_dir)) {
+    if (err) *err = L"Source folder not found: " + src_dir;
+    return false;
+  }
+  if (!EnsureDirExists(dst_dir)) {
+    if (err) *err = L"Failed to create folder: " + dst_dir;
+    return false;
+  }
+
+  std::wstring pattern = JoinPathLoose(src_dir, L"*");
+  WIN32_FIND_DATAW fd{};
+  HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE) {
+    DWORD le = GetLastError();
+    if (err) *err = L"Failed to list folder: " + src_dir + L" (error=" + std::to_wstring(le) + L" " + FormatWin32ErrorMessage(le) + L")";
+    return false;
+  }
+
+  auto close_find = [&](HANDLE hh) { FindClose(hh); };
+
+  for (;;) {
+    const wchar_t* name = fd.cFileName;
+    if (name && wcscmp(name, L".") != 0 && wcscmp(name, L"..") != 0) {
+      std::wstring sp = JoinPathLoose(src_dir, name);
+      std::wstring dp = JoinPathLoose(dst_dir, name);
+      bool is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+      // Safety: don't follow reparse points (junctions/symlinks). Data dir is expected to be plain files/folders.
+      if ((fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        continue;
+      }
+
+      if (is_dir) {
+        if (!CopyDirRecursive(sp, dp, err)) {
+          close_find(h);
+          return false;
+        }
+      } else {
+        if (!CopyFileW(sp.c_str(), dp.c_str(), FALSE)) {
+          DWORD le = GetLastError();
+          if (err) {
+            *err = L"Failed to copy file:\n" + sp + L"\n->\n" + dp +
+                   L"\n(error=" + std::to_wstring(le) + L" " + FormatWin32ErrorMessage(le) + L")";
+          }
+          close_find(h);
+          return false;
+        }
+      }
+    }
+
+    if (!FindNextFileW(h, &fd)) {
+      DWORD le = GetLastError();
+      close_find(h);
+      if (le == ERROR_NO_MORE_FILES) return true;
+      if (err) *err = L"Failed to enumerate folder: " + src_dir + L" (error=" + std::to_wstring(le) + L")";
+      return false;
+    }
+  }
+}
+
+static std::wstring ResolveImportDataRoot(const std::wstring& picked_folder) {
+  // Accept either:
+  // - a direct data root (contains categories/tasks/... or YYYY/MM/day files)
+  // - a wrapper folder that contains a "data" subfolder (common when users zip/copy the whole app folder)
+  auto looks_like_data_root = [&](const std::wstring& dir) -> bool {
+    if (!DirExistsW(dir)) return false;
+    if (FileExists(JoinPathLoose(dir, L"categories.txt"))) return true;
+    if (FileExists(JoinPathLoose(dir, L"tasks.wlt"))) return true;
+    if (FileExists(JoinPathLoose(dir, L"recurring_meetings.wlrp"))) return true;
+    if (FileExists(JoinPathLoose(dir, L"auth.wla"))) return true;
+
+    // Heuristic: any 4-digit year directory.
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(JoinPathLoose(dir, L"*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool ok = false;
+    do {
+      if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
+      if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+      const wchar_t* n = fd.cFileName;
+      if (wcslen(n) == 4 && iswdigit(n[0]) && iswdigit(n[1]) && iswdigit(n[2]) && iswdigit(n[3])) {
+        ok = true;
+        break;
+      }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return ok;
+  };
+
+  if (looks_like_data_root(picked_folder)) return picked_folder;
+  std::wstring sub = JoinPathLoose(picked_folder, L"data");
+  if (looks_like_data_root(sub)) return sub;
+  return L"";
+}
+
+static bool MoveDirReplace(const std::wstring& from, const std::wstring& to, std::wstring* err) {
+  if (err) err->clear();
+  if (MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) return true;
+  DWORD le = GetLastError();
+  if (err) *err = L"Move failed:\n" + from + L"\n->\n" + to + L"\n(error=" + std::to_wstring(le) + L" " + FormatWin32ErrorMessage(le) + L")";
+  return false;
+}
+
+static bool MoveDir(const std::wstring& from, const std::wstring& to, std::wstring* err) {
+  if (err) err->clear();
+  if (MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_WRITE_THROUGH) != 0) return true;
+  DWORD le = GetLastError();
+  if (err) *err = L"Move failed:\n" + from + L"\n->\n" + to + L"\n(error=" + std::to_wstring(le) + L" " + FormatWin32ErrorMessage(le) + L")";
+  return false;
+}
+
+static void ExportFullData(AppState* s) {
+  std::wstring pick;
+  if (!PickFolderDialog(s->hwnd, L"选择导出到的文件夹", &pick)) return;
+
+  std::wstring src = GetDataRootDir();
+  std::wstring dst = JoinPathLoose(pick, L"WorkLogLite-export-" + NowTimestampCompact());
+
+  if (IsUncPath(pick)) {
+    int r = MessageBoxW(s->hwnd,
+                        L"你选择的是网络共享路径(UNC)。\n\n"
+                        L"导出会通过网络写入数据，可能存在泄露风险。\n\n"
+                        L"仍要继续导出吗？",
+                        kAppTitle, MB_YESNO | MB_ICONWARNING);
+    if (r != IDYES) return;
+  }
+  if (IsSameOrChildDir(src, dst)) {
+    ShowInfoBox(s->hwnd, L"导出目标不能位于当前数据目录内部，否则会导致递归拷贝。\n\n请换一个导出目录。", L"导出失败");
+    return;
+  }
+
+  std::wstring err;
+  if (!CopyDirRecursive(src, dst, &err)) {
+    ShowInfoBox(s->hwnd, err.c_str(), L"导出失败");
+    return;
+  }
+
+  std::wstring done = L"已导出到：\n" + dst + L"\n\n说明：这是完整数据目录的原样拷贝（包含日数据、分类、长期任务、周期会议、密码设置等）。";
+  ShowInfoBox(s->hwnd, done.c_str(), L"导出完成");
+}
+
+static void ImportFullData(AppState* s) {
+  if (!PromptSaveIfDirty(s)) return;
+
+  std::wstring pick;
+  if (!PickFolderDialog(s->hwnd, L"选择要导入的数据文件夹", &pick)) return;
+
+  std::wstring src_root = ResolveImportDataRoot(pick);
+  if (src_root.empty()) {
+    ShowInfoBox(s->hwnd, L"所选文件夹看起来不像 WorkLogLite 的数据目录。\n\n请选中：包含 categories.txt / tasks.wlt / recurring_meetings.wlrp / auth.wla 或 YYYY\\MM\\YYYY-MM-DD.wlr 的目录。\n\n也支持选择包含 data 子目录的外层文件夹。", L"导入失败");
+    return;
+  }
+
+  if (IsUncPath(src_root)) {
+    int rr = MessageBoxW(s->hwnd,
+                         L"你选择的是网络共享路径(UNC)。\n\n"
+                         L"导入会通过网络读取数据。\n\n"
+                         L"仍要继续导入吗？",
+                         kAppTitle, MB_YESNO | MB_ICONWARNING);
+    if (rr != IDYES) return;
+  }
+
+  std::wstring dst_root = GetDataRootDir();
+  if (NormalizeDirForCompare(src_root) == NormalizeDirForCompare(dst_root)) {
+    ShowInfoBox(s->hwnd, L"你选择的正是当前数据目录。\n\n如果你的目标是备份/迁移，请使用“导出全部数据”。", L"导入已取消");
+    return;
+  }
+
+  int r = MessageBoxW(s->hwnd,
+                      L"即将用所选目录的数据“替换”当前数据目录。\n\n"
+                      L"- 会覆盖你当前的所有数据文件\n"
+                      L"- 会覆盖密码设置(auth.wla)，下次启动可能需要输入导入数据对应的密码\n"
+                      L"- 程序会自动创建一个备份目录\n\n"
+                      L"确定继续导入吗？",
+                      kAppTitle, MB_YESNO | MB_ICONWARNING);
+  if (r != IDYES) return;
+
+  std::wstring parent = ParentDirOf(dst_root);
+  if (parent.empty()) {
+    ShowInfoBox(s->hwnd, L"无法确定数据目录的父目录，导入已取消。", L"导入失败");
+    return;
+  }
+
+  std::wstring stamp = NowTimestampCompact();
+  std::wstring tmp = JoinPathLoose(parent, L"WorkLogLite-data-tmp-" + stamp);
+  std::wstring backup = JoinPathLoose(parent, L"WorkLogLite-data-backup-" + stamp);
+
+  std::wstring err;
+  if (!CopyDirRecursive(src_root, tmp, &err)) {
+    ShowInfoBox(s->hwnd, err.c_str(), L"导入失败(复制阶段)");
+    return;
+  }
+
+  // Swap: data -> backup, tmp -> data. This avoids partial overwrites and keeps a rollback path.
+  if (DirExistsW(dst_root)) {
+    if (!MoveDirReplace(dst_root, backup, &err)) {
+      ShowInfoBox(s->hwnd, err.c_str(), L"导入失败(备份阶段)");
+      return;
+    }
+  } else {
+    EnsureDirExists(dst_root);
+  }
+
+  if (!MoveDirReplace(tmp, dst_root, &err)) {
+    // Best-effort rollback.
+    std::wstring rollback_err;
+    MoveDirReplace(backup, dst_root, &rollback_err);
+    ShowInfoBox(s->hwnd, err.c_str(), L"导入失败(切换阶段)");
+    return;
+  }
+
+  // Reload caches and refresh UI.
+  {
+    std::wstring cat_err;
+    LoadCategories(&s->categories, &cat_err);
+    NormalizeCategories(&s->categories);
+    RefreshCategoryCombo(s);
+  }
+  {
+    std::wstring terr;
+    LoadTasks(&s->tasks, &terr);
+  }
+  {
+    std::wstring rerr;
+    LoadRecurringMeetings(&s->recurring_meetings, &rerr);
+  }
+  LoadSelectedDay(s, s->selected);
+
+  std::wstring done = L"导入完成。\n\n当前数据目录已替换。\n备份目录：\n" + backup +
+                      L"\n\n提示：如果导入的数据包含 auth.wla，下一次启动会按导入数据的密码要求进行验证。";
+  ShowInfoBox(s->hwnd, done.c_str(), L"导入完成");
+}
+
+static void ClearAllData(AppState* s) {
+  if (!PromptSaveIfDirty(s)) return;
+
+  std::wstring root = GetDataRootDir();
+  std::wstring parent = ParentDirOf(root);
+  if (parent.empty()) {
+    ShowInfoBox(s->hwnd, L"无法确定数据目录的父目录，清空已取消。", L"清空失败");
+    return;
+  }
+
+  // Ensure root exists so the backup move is predictable.
+  EnsureDirExists(root);
+
+  std::wstring stamp = NowTimestampCompact();
+  std::wstring backup = JoinPathLoose(parent, L"WorkLogLite-data-cleared-" + stamp);
+
+  std::wstring msg1 =
+      L"即将清空本机所有 WorkLogLite 数据(重置)。\n\n"
+      L"会清空的数据包括：\n"
+      L"- 所有日记录(.wlr)\n"
+      L"- 分类(categories.txt)\n"
+      L"- 长期任务(tasks.wlt)\n"
+      L"- 周期会议(recurring_meetings.wlrp)\n"
+      L"- 密码设置(auth.wla)\n\n"
+      L"当前数据目录：\n" + root + L"\n\n"
+      L"程序会先把整个目录移动到备份目录(可回滚)：\n" + backup + L"\n\n"
+      L"确定继续？";
+  int r1 = MessageBoxW(s->hwnd, msg1.c_str(), kAppTitle, MB_YESNO | MB_ICONWARNING);
+  if (r1 != IDYES) return;
+
+  int r2 = MessageBoxW(s->hwnd, L"最后确认：真的要清空全部数据吗？\n\n提示：你可以先用“导出全部数据”做一份拷贝。",
+                       kAppTitle, MB_YESNO | MB_ICONWARNING);
+  if (r2 != IDYES) return;
+
+  std::wstring err;
+  if (!MoveDir(root, backup, &err)) {
+    ShowInfoBox(s->hwnd, err.c_str(), L"清空失败(备份阶段)");
+    return;
+  }
+
+  // Create a brand new empty root.
+  if (!EnsureDirExists(root)) {
+    ShowInfoBox(s->hwnd, (L"无法创建新的数据目录：\n" + root).c_str(), L"清空失败");
+    return;
+  }
+
+  // Reload caches and refresh UI (will recreate default categories file on first load).
+  {
+    std::wstring cat_err;
+    LoadCategories(&s->categories, &cat_err);
+    NormalizeCategories(&s->categories);
+    RefreshCategoryCombo(s);
+  }
+  s->tasks.clear();
+  s->recurring_meetings.clear();
+
+  LoadSelectedDay(s, s->selected);
+
+  std::wstring done =
+      L"已清空数据并完成重置。\n\n"
+      L"备份目录：\n" + backup + L"\n\n"
+      L"提示：下次启动会要求重新设置密码(因为 auth.wla 已清空)。";
+  ShowInfoBox(s->hwnd, done.c_str(), L"清空完成");
 }
 
 struct ReportWindowState {
@@ -1847,7 +2382,7 @@ static LRESULT CALLBACK PreviewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 
 static void ShowPreviewWindow(HWND owner, const std::wstring& title, const std::wstring& markdown) {
   // Ensure rich edit class is available.
-  LoadLibraryW(L"Msftedit.dll");
+  TryLoadRichEditMsftedit();
 
   WNDCLASSW wc{};
   wc.lpfnWndProc = PreviewWndProc;
@@ -3400,12 +3935,18 @@ static HMENU CreateAppMenu() {
 
   HMENU tools = CreateMenu();
   AppendMenuW(tools, MF_STRING, IDM_OPEN_DATA_DIR, L"打开数据目录");
+  AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(tools, MF_STRING, IDM_EXPORT_FULL_DATA, L"导出全部数据...");
+  AppendMenuW(tools, MF_STRING, IDM_IMPORT_FULL_DATA, L"导入全部数据...");
+  AppendMenuW(tools, MF_STRING, IDM_CLEAR_ALL_DATA, L"清空全部数据(重置)...");
+  AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(tools, MF_STRING, IDM_MANAGE_CATEGORIES, L"管理分类...\tCtrl+K");
   AppendMenuW(tools, MF_STRING, IDM_MANAGE_TASKS, L"管理长期任务...\tCtrl+T");
   AppendMenuW(tools, MF_STRING, IDM_MANAGE_RECURRING_MEETINGS, L"管理周期会议...\tCtrl+R");
   AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(tools, MF_STRING, IDM_GENERATE_DEMO_DATA, L"生成示例数据(演示)...");
   AppendMenuW(tools, MF_STRING, IDM_CHANGE_PASSWORD, L"修改密码...");
+  AppendMenuW(tools, MF_STRING, IDM_DISABLE_PASSWORD_LOGIN, L"取消密码登录(不推荐)...");
   AppendMenuW(menu, MF_POPUP, (UINT_PTR)tools, L"工具");
 
   HMENU help = CreateMenu();
@@ -3774,6 +4315,18 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         OpenDataDir(s);
         return 0;
       }
+      if (id == IDM_EXPORT_FULL_DATA) {
+        ExportFullData(s);
+        return 0;
+      }
+      if (id == IDM_IMPORT_FULL_DATA) {
+        ImportFullData(s);
+        return 0;
+      }
+      if (id == IDM_CLEAR_ALL_DATA) {
+        ClearAllData(s);
+        return 0;
+      }
       if (id == IDM_MANAGE_CATEGORIES) {
         if (!PromptSaveIfDirty(s)) return 0;
         ShowManageCategoriesWindow(s);
@@ -3863,6 +4416,11 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         ChangePasswordFlow(hwnd);
         return 0;
       }
+      if (id == IDM_DISABLE_PASSWORD_LOGIN) {
+        if (!PromptSaveIfDirty(s)) return 0;
+        DisablePasswordLoginFlow(hwnd);
+        return 0;
+      }
       if (id == IDM_HELP) {
         ShowHelp(s);
         return 0;
@@ -3902,8 +4460,6 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
       if (src != s->list) return DefWindowProcW(hwnd, msg, wParam, lParam);
 
-      if (!PromptSaveIfDirty(s)) return 0;
-
       POINT pt{};
       if (lParam == (LPARAM)-1) {
         GetCursorPos(&pt);
@@ -3921,10 +4477,12 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       if (hit >= 0) {
         ListView_SetItemState(s->list, hit, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
         ListView_EnsureVisible(s->list, hit, FALSE);
-        UpdateEditorFromListSelection(s);
       }
 
       int sel = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
+      // If selection change was blocked (e.g. user canceled the save prompt), don't show a menu that would act on
+      // a different item than the one the user right-clicked.
+      if (hit >= 0 && sel != hit) return 0;
       if (sel < 0 || sel >= (int)s->day.entries.size()) return 0;
       const Entry& e = s->day.entries[(size_t)sel];
 
@@ -3958,7 +4516,12 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       if (!s || !hdr) return 0;
 
       if (hdr->idFrom == IDC_CAL && hdr->code == MCN_SELCHANGE) {
+        if (s->ignore_cal_selchange) {
+          s->ignore_cal_selchange = false;
+          return 0;
+        }
         if (!PromptSaveIfDirty(s)) {
+          s->ignore_cal_selchange = true;
           MonthCal_SetCurSel(s->cal, &s->selected);
           return 0;
         }
@@ -3986,23 +4549,29 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
           }
           return CDRF_DODEFAULT;
         }
+        if (hdr->code == LVN_ITEMCHANGING) {
+          auto* p = reinterpret_cast<NMLISTVIEW*>(lParam);
+          if ((p->uChanged & LVIF_STATE) &&
+              (p->uNewState & LVIS_SELECTED) && !(p->uOldState & LVIS_SELECTED)) {
+            if (!PromptSaveIfDirty(s)) {
+              // Returning TRUE cancels the selection change without triggering extra state churn.
+              return TRUE;
+            }
+          }
+          return FALSE;
+        }
         if (hdr->code == LVN_ITEMCHANGED) {
           auto* p = reinterpret_cast<NMLISTVIEW*>(lParam);
           if ((p->uChanged & LVIF_STATE) && (p->uNewState & LVIS_SELECTED)) {
-            if (!PromptSaveIfDirty(s)) {
-              // Revert selection change.
-              ListView_SetItemState(s->list, p->iItem, 0, LVIS_SELECTED);
-              return 0;
-            }
             UpdateEditorFromListSelection(s);
           }
           return 0;
         }
         if (hdr->code == NM_DBLCLK) {
-          if (!PromptSaveIfDirty(s)) return 0;
           auto* act = reinterpret_cast<NMITEMACTIVATE*>(lParam);
           if (act && act->iItem < 0) {
             // Double click on empty space: start a new entry (common expectation).
+            if (!PromptSaveIfDirty(s)) return 0;
             ClearEditor(s);
             HWND h = GetComboEditHandle(s->cb_category);
             SetFocus(h ? h : s->cb_category);
@@ -4038,7 +4607,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
   InitCommonControlsEx(&icc);
 
   // RichEdit (msftedit) is a Windows component, loaded on demand.
-  LoadLibraryW(L"Msftedit.dll");
+  TryLoadRichEditMsftedit();
 
   AppState state{};
 

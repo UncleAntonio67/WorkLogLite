@@ -5,6 +5,8 @@
 /portable/data/
 /.vs/
 /.vscode/
+.toolchain/
+.tmp/
 *.obj
 *.pdb
 *.ilk

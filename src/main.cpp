@@ -3440,8 +3440,34 @@ static std::wstring GetTaskMaterialsRootDir() {
   return root;
 }
 
+static std::wstring SanitizeDirNameComponent(std::wstring s) {
+  // Windows forbids: < > : " / \ | ? * and control chars.
+  // Also trailing dots/spaces are problematic for folders.
+  for (auto& ch : s) {
+    if (ch < 32) { ch = L'_'; continue; }
+    switch (ch) {
+      case L'<':
+      case L'>':
+      case L':':
+      case L'"':
+      case L'/':
+      case L'\\':
+      case L'|':
+      case L'?':
+      case L'*': ch = L'_'; break;
+      default: break;
+    }
+  }
+  while (!s.empty() && (s.back() == L' ' || s.back() == L'.')) s.pop_back();
+  while (!s.empty() && (s.front() == L' ')) s.erase(s.begin());
+  if (s.empty()) s = L"task";
+  if (s.size() > 80) s.resize(80);
+  return s;
+}
+
 static std::wstring GetTaskMaterialsDirById(const std::wstring& task_id) {
-  std::wstring dir = JoinPath(GetTaskMaterialsRootDir(), task_id);
+  std::wstring safe = SanitizeDirNameComponent(task_id);
+  std::wstring dir = JoinPath(GetTaskMaterialsRootDir(), safe);
   EnsureDirExists(dir);
   return dir;
 }
@@ -4164,7 +4190,7 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     case WM_CONTEXTMENU: {
       if (!s) return 0;
       HWND src = (HWND)wParam;
-      if (src != s->re_desc) return DefWindowProcW(hwnd, msg, wParam, lParam);
+      if (src != s->re_desc && src != s->list) return DefWindowProcW(hwnd, msg, wParam, lParam);
 
       POINT pt{};
       if (lParam == (LPARAM)-1) {
@@ -4172,6 +4198,28 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       } else {
         pt.x = GET_X_LPARAM(lParam);
         pt.y = GET_Y_LPARAM(lParam);
+      }
+
+      if (src == s->list) {
+        int idx = TaskGetSelectedIndex(s);
+        bool has_sel = (idx >= 0 && idx < (int)s->working.size());
+
+        HMENU m = CreatePopupMenu();
+        if (!m) return 0;
+        AppendMenuW(m, MF_STRING | (has_sel ? 0 : MF_GRAYED), 1001, L"打开材料目录");
+        AppendMenuW(m, MF_STRING, 1002, L"打开任务材料根目录");
+
+        UINT cmd = TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd, nullptr);
+        DestroyMenu(m);
+        if (!cmd) return 0;
+
+        if (cmd == 1001 && has_sel) {
+          OpenTaskMaterialsDir(hwnd, s->working[(size_t)idx].id);
+        } else if (cmd == 1002) {
+          std::wstring root = GetTaskMaterialsRootDir();
+          ShellExecuteW(nullptr, L"open", root.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        return 0;
       }
 
       HMENU menu = CreatePopupMenu();
@@ -4238,6 +4286,10 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
           ShowInfoBox(hwnd, err.c_str(), L"保存失败");
           return 0;
         }
+
+        // Ensure each long-term task has a stable materials folder.
+        // We intentionally do NOT delete it when the task is deleted, to avoid data loss.
+        (void)GetTaskMaterialsDirById(t.id);
         s->app->tasks = s->working;
 
         TaskRefreshList(s);

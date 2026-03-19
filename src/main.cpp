@@ -49,11 +49,13 @@ enum : UINT {
   IDM_GENERATE_DEMO_DATA = 1050,
   IDM_CHANGE_PASSWORD = 1060,
   IDM_DISABLE_PASSWORD_LOGIN = 1061,
+  IDM_VIEW_TASK_PROGRESS = 1062,
   IDM_HELP = 1100,
 
   // Context menu (ListView)
   IDM_CTX_CREATE_TASK_FROM_MEETING = 20001,
   IDM_CTX_INSERT_MEETING_TEMPLATE = 20002,
+  IDM_CTX_VIEW_TASK_PROGRESS = 20003,
 
   // Formatting (RichEdit body)
   IDM_FMT_BOLD = 30001,
@@ -2042,6 +2044,245 @@ static void ClearAllData(AppState* s) {
   ShowInfoBox(s->hwnd, done.c_str(), L"清空完成");
 }
 
+static int DaysBetween(const SYSTEMTIME& a, const SYSTEMTIME& b) {
+  // b - a in days
+  FILETIME fta{}, ftb{};
+  SYSTEMTIME sa = a, sb = b;
+  SystemTimeToFileTime(&sa, &fta);
+  SystemTimeToFileTime(&sb, &ftb);
+  ULARGE_INTEGER ua{}, ub{};
+  ua.LowPart = fta.dwLowDateTime;
+  ua.HighPart = fta.dwHighDateTime;
+  ub.LowPart = ftb.dwLowDateTime;
+  ub.HighPart = ftb.dwHighDateTime;
+  const ULONGLONG kDay = 86400ULL * 10000000ULL;
+  if (ub.QuadPart < ua.QuadPart) return -(int)((ua.QuadPart - ub.QuadPart) / kDay);
+  return (int)((ub.QuadPart - ua.QuadPart) / kDay);
+}
+
+static const Task* FindTaskByIdInState(AppState* s, const std::wstring& id) {
+  if (!s) return nullptr;
+  for (const auto& t : s->tasks) {
+    if (t.id == id) return &t;
+  }
+  return nullptr;
+}
+
+static std::wstring SanitizeFileName(const std::wstring& s) {
+  std::wstring out = s;
+  for (auto& ch : out) {
+    if (ch == L'<' || ch == L'>' || ch == L':' || ch == L'"' || ch == L'/' || ch == L'\\' || ch == L'|' ||
+        ch == L'?' || ch == L'*') {
+      ch = L'_';
+    }
+  }
+  return out;
+}
+
+static ReportRange DefaultRangeForTaskProgress(AppState* s, const std::wstring& task_id) {
+  ReportRange r{};
+  const Task* t = FindTaskByIdInState(s, task_id);
+  if (t && t->start.wYear != 0 && t->end.wYear != 0) {
+    r.start = t->start;
+    r.end = t->end;
+    return r;
+  }
+  SYSTEMTIME now{};
+  GetLocalTime(&now);
+  r.end = now;
+  r.start = AddDays(now, -30);
+  return r;
+}
+
+static void ShowReportWindow(HWND owner, const std::wstring& title, const std::wstring& md, const std::wstring& default_name);
+
+static void ViewTaskProgressSummary(AppState* s, const std::wstring& task_id) {
+  if (!s) return;
+  if (task_id.empty()) return;
+
+  ReportRange r = DefaultRangeForTaskProgress(s, task_id);
+  if (DaysBetween(r.start, r.end) < 0) {
+    SYSTEMTIME tmp = r.start;
+    r.start = r.end;
+    r.end = tmp;
+  }
+
+  int days = DaysBetween(r.start, r.end) + 1;
+  if (days > 400) {
+    std::wstring msg = L"该任务的汇总范围较大：\n" + FormatDateYYYYMMDD(r.start) + L" ~ " + FormatDateYYYYMMDD(r.end) +
+                       L"\n共 " + std::to_wstring(days) + L" 天。\n\n生成汇总可能较慢，是否继续？";
+    int rr = MessageBoxW(s->hwnd, msg.c_str(), kAppTitle, MB_YESNO | MB_ICONWARNING);
+    if (rr != IDYES) return;
+  }
+
+  bool include_empty_days = (days <= 60);
+  std::wstring md, err;
+  if (!GenerateTaskProgressMarkdown(task_id, r, include_empty_days, &md, &err)) {
+    ShowInfoBox(s->hwnd, err.c_str(), L"生成失败");
+    return;
+  }
+
+  const Task* t = FindTaskByIdInState(s, task_id);
+  std::wstring title = L"任务进展汇总";
+  if (t && !t->title.empty()) title += L": " + t->title;
+
+  std::wstring file = L"task-progress-" + SanitizeFileName(task_id) + L"-" + FormatDateYYYYMMDD(r.start) + L"-" + FormatDateYYYYMMDD(r.end) + L".md";
+  ShowReportWindow(s->hwnd, title, md, file);
+}
+
+struct PickTaskWindowState {
+  HWND hwnd{};
+  HWND list{};
+  HWND btn_ok{};
+  HWND btn_cancel{};
+  HFONT font{};
+
+  AppState* app{};
+  std::vector<std::wstring> ids;
+  bool ok{false};
+  std::wstring out_id;
+};
+
+static void PickTaskRefreshList(PickTaskWindowState* s) {
+  if (!s || !s->list) return;
+  SendMessageW(s->list, LB_RESETCONTENT, 0, 0);
+  s->ids.clear();
+  if (!s->app) return;
+  for (const auto& t : s->app->tasks) {
+    if (t.id.empty() || t.title.empty()) continue;
+    std::wstring line = t.title;
+    if (!t.category.empty()) line = L"[" + t.category + L"] " + line;
+    SendMessageW(s->list, LB_ADDSTRING, 0, (LPARAM)line.c_str());
+    s->ids.push_back(t.id);
+  }
+  if (!s->ids.empty()) SendMessageW(s->list, LB_SETCURSEL, 0, 0);
+}
+
+static int PickTaskGetSelectedIndex(PickTaskWindowState* s) {
+  if (!s || !s->list) return -1;
+  return (int)SendMessageW(s->list, LB_GETCURSEL, 0, 0);
+}
+
+static LRESULT CALLBACK PickTaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+  auto* s = reinterpret_cast<PickTaskWindowState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+  switch (msg) {
+    case WM_CREATE: {
+      auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+      s = reinterpret_cast<PickTaskWindowState*>(cs->lpCreateParams);
+      s->hwnd = hwnd;
+      SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(s));
+      s->font = CreateUiFont(hwnd);
+
+      s->list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+                                WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP,
+                                0, 0, 10, 10, hwnd, (HMENU)1, nullptr, nullptr);
+      s->btn_ok = CreateWindowExW(0, L"BUTTON", L"查看汇总",
+                                  WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                  0, 0, 10, 10, hwnd, (HMENU)2, nullptr, nullptr);
+      s->btn_cancel = CreateWindowExW(0, L"BUTTON", L"取消",
+                                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                      0, 0, 10, 10, hwnd, (HMENU)3, nullptr, nullptr);
+
+      SetControlFont(s->list, s->font);
+      SetControlFont(s->btn_ok, s->font);
+      SetControlFont(s->btn_cancel, s->font);
+
+      PickTaskRefreshList(s);
+      return 0;
+    }
+    case WM_SIZE: {
+      int w = LOWORD(lParam);
+      int h = HIWORD(lParam);
+      int pad = ScalePx(hwnd, 10);
+      int btn_h = ScalePx(hwnd, 30);
+      int btn_w = ScalePx(hwnd, 110);
+      int y_btn = h - pad - btn_h;
+      MoveWindow(s->list, pad, pad, w - 2 * pad, y_btn - 2 * pad, TRUE);
+      int x = w - pad - btn_w;
+      MoveWindow(s->btn_cancel, x, y_btn, btn_w, btn_h, TRUE);
+      x -= pad + btn_w;
+      MoveWindow(s->btn_ok, x, y_btn, btn_w, btn_h, TRUE);
+      return 0;
+    }
+    case WM_COMMAND: {
+      int id = LOWORD(wParam);
+      int code = HIWORD(wParam);
+      if (id == 2) {
+        int idx = PickTaskGetSelectedIndex(s);
+        if (idx >= 0 && idx < (int)s->ids.size()) {
+          s->ok = true;
+          s->out_id = s->ids[(size_t)idx];
+          DestroyWindow(hwnd);
+        }
+        return 0;
+      }
+      if (id == 3) {
+        DestroyWindow(hwnd);
+        return 0;
+      }
+      if (id == 1 && code == LBN_DBLCLK) {
+        SendMessageW(hwnd, WM_COMMAND, 2, 0);
+        return 0;
+      }
+      return 0;
+    }
+    case WM_DESTROY: {
+      if (s && s->font) DeleteObject(s->font);
+      return 0;
+    }
+  }
+  return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static bool PromptPickTaskId(AppState* app, std::wstring* out_task_id) {
+  if (out_task_id) out_task_id->clear();
+  if (!app) return false;
+  if (app->tasks.empty()) {
+    ShowInfoBox(app->hwnd, L"当前没有长期任务。请先在“工具 -> 管理长期任务”中创建任务。", L"提示");
+    return false;
+  }
+
+  WNDCLASSW wc{};
+  wc.lpfnWndProc = PickTaskWndProc;
+  wc.hInstance = GetModuleHandleW(nullptr);
+  wc.lpszClassName = L"WorkLogLitePickTaskWnd";
+  wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+  wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+  RegisterClassW(&wc);
+
+  PickTaskWindowState state{};
+  state.app = app;
+
+  HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, wc.lpszClassName, L"选择任务",
+                              WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 720, 520,
+                              app->hwnd, nullptr, wc.hInstance, &state);
+  if (!hwnd) {
+    ShowLastErrorBox(app->hwnd, L"CreateWindowEx(PickTask)");
+    return false;
+  }
+
+  EnableWindow(app->hwnd, FALSE);
+  while (IsWindow(hwnd)) {
+    MSG msg{};
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+      if (msg.message == WM_QUIT) {
+        PostQuitMessage((int)msg.wParam);
+        EnableWindow(app->hwnd, TRUE);
+        return false;
+      }
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
+    WaitMessage();
+  }
+  EnableWindow(app->hwnd, TRUE);
+  SetForegroundWindow(app->hwnd);
+
+  if (state.ok && out_task_id) *out_task_id = state.out_id;
+  return state.ok;
+}
+
 struct ReportWindowState {
   HWND hwnd{};
   HWND edit{};
@@ -3958,6 +4199,7 @@ static HMENU CreateAppMenu() {
   AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(tools, MF_STRING, IDM_MANAGE_CATEGORIES, L"管理分类...\tCtrl+K");
   AppendMenuW(tools, MF_STRING, IDM_MANAGE_TASKS, L"管理长期任务...\tCtrl+T");
+  AppendMenuW(tools, MF_STRING, IDM_VIEW_TASK_PROGRESS, L"查看任务每日进展汇总...");
   AppendMenuW(tools, MF_STRING, IDM_MANAGE_RECURRING_MEETINGS, L"管理周期会议...\tCtrl+R");
   AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(tools, MF_STRING, IDM_GENERATE_DEMO_DATA, L"生成示例数据(演示)...");
@@ -4375,6 +4617,14 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         SetFocus(s->ed_body);
         return 0;
       }
+      if (id == IDM_CTX_VIEW_TASK_PROGRESS) {
+        int sel = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
+        if (sel < 0 || sel >= (int)s->day.entries.size()) return 0;
+        const Entry& e = s->day.entries[(size_t)sel];
+        if (e.type != EntryType::TaskProgress || e.task_id.empty()) return 0;
+        ViewTaskProgressSummary(s, e.task_id);
+        return 0;
+      }
       if (id == IDM_CTX_CREATE_TASK_FROM_MEETING) {
         if (!PromptSaveIfDirty(s)) return 0;
         int sel = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
@@ -4435,6 +4685,12 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       if (id == IDM_DISABLE_PASSWORD_LOGIN) {
         if (!PromptSaveIfDirty(s)) return 0;
         DisablePasswordLoginFlow(hwnd);
+        return 0;
+      }
+      if (id == IDM_VIEW_TASK_PROGRESS) {
+        std::wstring tid;
+        if (!PromptPickTaskId(s, &tid)) return 0;
+        ViewTaskProgressSummary(s, tid);
         return 0;
       }
       if (id == IDM_HELP) {
@@ -4514,6 +4770,9 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             AppendMenuW(menu, MF_STRING, IDM_CTX_INSERT_MEETING_TEMPLATE, L"插入周期会议模板");
           }
         }
+      }
+      if (e.type == EntryType::TaskProgress && !e.task_id.empty()) {
+        AppendMenuW(menu, MF_STRING, IDM_CTX_VIEW_TASK_PROGRESS, L"查看该任务每日进展汇总...");
       }
 
       if (GetMenuItemCount(menu) == 0) {

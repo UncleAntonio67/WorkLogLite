@@ -24,3 +24,12 @@ bool GenerateReportMarkdownByCategory(const ReportRange& range, std::wstring* ou
 // Flat CSV export for further processing (Excel/Python/etc).
 // One row per entry, includes task metadata when applicable.
 bool GenerateReportCsvFlat(const ReportRange& range, std::wstring* out_csv, std::wstring* err);
+
+// Task-focused daily progress summary.
+// Only includes entries with type=task and matching task_id.
+// If include_empty_days is true, days without progress will still be emitted as "(无记录)".
+bool GenerateTaskProgressMarkdown(const std::wstring& task_id,
+                                 const ReportRange& range,
+                                 bool include_empty_days,
+                                 std::wstring* out_md,
+                                 std::wstring* err);

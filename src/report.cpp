@@ -358,3 +358,109 @@ bool GenerateReportCsvFlat(const ReportRange& range, std::wstring* out_csv, std:
   *out_csv = csv.str();
   return true;
 }
+
+static const Task* FindTaskById(const std::vector<Task>& tasks, const std::wstring& id) {
+  for (const auto& t : tasks) {
+    if (t.id == id) return &t;
+  }
+  return nullptr;
+}
+
+static std::wstring StatusToCNTask(EntryStatus s) {
+  switch (s) {
+    case EntryStatus::Todo: return L"未开始";
+    case EntryStatus::Doing: return L"进行中";
+    case EntryStatus::Blocked: return L"阻塞";
+    case EntryStatus::Done: return L"已完成";
+    case EntryStatus::None:
+    default: return L"";
+  }
+}
+
+bool GenerateTaskProgressMarkdown(const std::wstring& task_id,
+                                 const ReportRange& range,
+                                 bool include_empty_days,
+                                 std::wstring* out_md,
+                                 std::wstring* err) {
+  if (!out_md) return false;
+  out_md->clear();
+  if (task_id.empty()) {
+    if (err) *err = L"task_id 为空。";
+    return false;
+  }
+
+  // Load task metadata (best-effort).
+  std::vector<Task> tasks;
+  {
+    std::wstring terr;
+    LoadTasks(&tasks, &terr);
+  }
+  const Task* task = FindTaskById(tasks, task_id);
+
+  std::wstringstream md;
+  std::wstring title = task ? task->title : (L"(任务 " + task_id + L")");
+  md << L"# 任务进展汇总: " << title << L"\n\n";
+
+  md << L"- task_id: `" << task_id << L"`\n";
+  if (task) {
+    if (!task->category.empty()) md << L"- 分类: " << task->category << L"\n";
+    std::wstring st = StatusToCNTask(task->status);
+    if (!st.empty()) md << L"- 状态: " << st << L"\n";
+    if (task->start.wYear != 0 && task->end.wYear != 0) {
+      md << L"- 任务周期: " << FormatDateYYYYMMDD(task->start) << L" ~ " << FormatDateYYYYMMDD(task->end) << L"\n";
+    }
+    if (!task->basis.empty()) md << L"- 依据: " << task->basis << L"\n";
+    if (!task->desc_plain.empty()) {
+      md << L"- 说明:\n";
+      EmitBodyIndented(&md, task->desc_plain);
+    }
+  }
+  md << L"\n";
+
+  md << L"范围: " << FormatDateYYYYMMDD(range.start) << L" ~ " << FormatDateYYYYMMDD(range.end) << L"\n\n";
+
+  int days_with_progress = 0;
+  int total_entries = 0;
+
+  SYSTEMTIME cur = range.start;
+  while (DateLeq(cur, range.end)) {
+    DayData day{};
+    std::wstring load_err;
+    if (!LoadDayFile(cur, &day, &load_err)) {
+      if (err) *err = L"读取失败: " + FormatDateYYYYMMDD(cur) + L"\n" + load_err;
+      return false;
+    }
+
+    std::vector<const Entry*> es;
+    for (const auto& e : day.entries) {
+      if (e.type == EntryType::TaskProgress && e.task_id == task_id) es.push_back(&e);
+    }
+
+    if (!es.empty() || include_empty_days) {
+      md << L"## " << FormatDateYYYYMMDD(cur) << L"\n";
+      if (es.empty()) {
+        md << L"(无记录)\n\n";
+      } else {
+        days_with_progress++;
+        for (const auto* ep : es) {
+          const Entry& e = *ep;
+          total_entries++;
+          md << L"- ";
+          std::wstring tr = TimeRange(e);
+          if (!tr.empty()) md << tr << L" ";
+          md << (e.title.empty() ? L"(无标题)" : e.title) << L"\n";
+          EmitBodyIndented(&md, e.body_plain);
+        }
+        md << L"\n";
+      }
+    }
+
+    cur = AddDays(cur, 1);
+  }
+
+  md << L"---\n";
+  md << L"统计: 有进展日期 " << days_with_progress << L" 天, 进展条目 " << total_entries << L" 条。\n";
+
+  *out_md = md.str();
+  return true;
+}

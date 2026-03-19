@@ -4,6 +4,7 @@
 #include "tasks.h"
 #include "win32_util.h"
 
+#include <algorithm>
 #include <map>
 #include <sstream>
 #include <string>
@@ -59,6 +60,20 @@ static std::wstring TimeRange(const Entry& e) {
   std::wstring st = e.start_time.empty() ? L"??:??" : e.start_time;
   std::wstring et = e.end_time.empty() ? L"??:??" : e.end_time;
   return st + L"-" + et;
+}
+
+static int ParseHHMMMinutes(const std::wstring& t) {
+  // Returns minutes since 00:00, or -1 if invalid/empty.
+  if (t.size() != 5) return -1;
+  if (t[2] != L':') return -1;
+  if (t[0] < L'0' || t[0] > L'9') return -1;
+  if (t[1] < L'0' || t[1] > L'9') return -1;
+  if (t[3] < L'0' || t[3] > L'9') return -1;
+  if (t[4] < L'0' || t[4] > L'9') return -1;
+  int hh = (t[0] - L'0') * 10 + (t[1] - L'0');
+  int mm = (t[3] - L'0') * 10 + (t[4] - L'0');
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return -1;
+  return hh * 60 + mm;
 }
 
 static void EmitBodyIndented(std::wstringstream* md, const std::wstring& body) {
@@ -431,27 +446,75 @@ bool GenerateTaskProgressMarkdown(const std::wstring& task_id,
       return false;
     }
 
-    std::vector<const Entry*> es;
+    struct Row {
+      int start_min{-1};
+      std::wstring time;
+      std::wstring title;
+      std::wstring body;
+    };
+    std::vector<Row> rows;
+    rows.reserve(8);
     for (const auto& e : day.entries) {
-      if (e.type == EntryType::TaskProgress && e.task_id == task_id) es.push_back(&e);
+      if (e.type != EntryType::TaskProgress) continue;
+      if (e.task_id != task_id) continue;
+      Row r{};
+      r.start_min = ParseHHMMMinutes(e.start_time);
+      r.time = TimeRange(e);
+      r.title = e.title.empty() ? L"(无标题)" : e.title;
+      r.body = e.body_plain;
+      rows.push_back(std::move(r));
     }
 
-    if (!es.empty() || include_empty_days) {
+    if (!rows.empty() || include_empty_days) {
       md << L"## " << FormatDateYYYYMMDD(cur) << L"\n";
-      if (es.empty()) {
+      if (rows.empty()) {
         md << L"(无记录)\n\n";
       } else {
         days_with_progress++;
-        for (const auto* ep : es) {
-          const Entry& e = *ep;
-          total_entries++;
-          md << L"- ";
-          std::wstring tr = TimeRange(e);
-          if (!tr.empty()) md << tr << L" ";
-          md << (e.title.empty() ? L"(无标题)" : e.title) << L"\n";
-          EmitBodyIndented(&md, e.body_plain);
+
+        // Bucket by time-of-day for readability.
+        enum : int { kLateNight = 0, kMorning = 1, kAfternoon = 2, kEvening = 3, kNoTime = 4, kBuckets = 5 };
+        auto bucket_of = [&](const Row& r) -> int {
+          if (r.start_min < 0) return kNoTime;
+          if (r.start_min < 6 * 60) return kLateNight;      // 00:00-05:59
+          if (r.start_min < 12 * 60) return kMorning;       // 06:00-11:59
+          if (r.start_min < 18 * 60) return kAfternoon;     // 12:00-17:59
+          return kEvening;                                  // 18:00-23:59
+        };
+        const wchar_t* bucket_title[kBuckets] = {
+            L"深夜 (00:00-06:00)",
+            L"上午 (06:00-12:00)",
+            L"下午 (12:00-18:00)",
+            L"晚上 (18:00-24:00)",
+            L"未填写时间",
+        };
+
+        std::vector<Row> b[kBuckets];
+        for (auto& r : rows) {
+          b[bucket_of(r)].push_back(std::move(r));
         }
-        md << L"\n";
+        auto sort_bucket = [&](std::vector<Row>& v) {
+          std::sort(v.begin(), v.end(), [](const Row& a, const Row& b) {
+            int am = a.start_min < 0 ? 99999 : a.start_min;
+            int bm = b.start_min < 0 ? 99999 : b.start_min;
+            if (am != bm) return am < bm;
+            return a.title < b.title;
+          });
+        };
+        for (int i = 0; i < kBuckets; i++) sort_bucket(b[i]);
+
+        for (int i = 0; i < kBuckets; i++) {
+          if (b[i].empty()) continue;
+          md << L"### " << bucket_title[i] << L"\n";
+          for (const auto& r : b[i]) {
+            total_entries++;
+            md << L"- ";
+            if (!r.time.empty()) md << r.time << L" ";
+            md << r.title << L"\n";
+            EmitBodyIndented(&md, r.body);
+          }
+          md << L"\n";
+        }
       }
     }
 

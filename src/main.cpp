@@ -145,6 +145,7 @@ struct AppState {
   int editing_index{-1};  // -1 => new entry
   bool editor_dirty{false};
   bool ignore_cal_selchange{false};  // avoid repeated prompts when we programmatically revert calendar selection
+  bool suppress_dirty_prompt{false};  // avoid re-entrant prompts triggered by programmatic UI updates while saving
 
   std::vector<std::wstring> categories;
   std::vector<Task> tasks;
@@ -854,6 +855,17 @@ static bool PersistDay(AppState* s) {
 }
 
 static bool SaveCurrent(AppState* s) {
+  // Saving can trigger programmatic list refresh/selection changes which would otherwise re-enter
+  // PromptSaveIfDirty and create a prompt loop. Suppress prompts during the save operation.
+  struct Guard {
+    AppState* s{};
+    bool old{};
+    ~Guard() {
+      if (s) s->suppress_dirty_prompt = old;
+    }
+  } guard{s, s ? s->suppress_dirty_prompt : false};
+  if (s) s->suppress_dirty_prompt = true;
+
   bool changed = false;
   if (!SaveEditorToModel(s, &changed)) return false;
   if (!changed) {
@@ -864,14 +876,17 @@ static bool SaveCurrent(AppState* s) {
     return true;
   }
   if (!PersistDay(s)) return false;
+
+  // Clear dirty flags before any UI churn (RefreshList/selection changes) to avoid prompt loops.
+  SetEditorDirty(s, false);
+  if (s->ed_title) SendMessageW(s->ed_title, EM_SETMODIFY, FALSE, 0);
+  if (s->ed_body) SendMessageW(s->ed_body, EM_SETMODIFY, FALSE, 0);
+
   RefreshList(s);
   if (s->editing_index >= 0) {
     ListView_SetItemState(s->list, s->editing_index, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
     ListView_EnsureVisible(s->list, s->editing_index, FALSE);
   }
-  SetEditorDirty(s, false);
-  if (s->ed_title) SendMessageW(s->ed_title, EM_SETMODIFY, FALSE, 0);
-  if (s->ed_body) SendMessageW(s->ed_body, EM_SETMODIFY, FALSE, 0);
   UpdateStatusBar(s);
   return true;
 }
@@ -913,6 +928,7 @@ static void DiscardEditorChanges(AppState* s) {
 }
 
 static bool PromptSaveIfDirty(AppState* s) {
+  if (s && s->suppress_dirty_prompt) return true;
   if (!IsEditorTrulyDirty(s)) return true;
   int r = MessageBoxW(s->hwnd, L"当前编辑尚未保存。是否保存？", kAppTitle, MB_YESNOCANCEL | MB_ICONWARNING);
   if (r == IDCANCEL) return false;

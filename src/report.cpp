@@ -512,6 +512,7 @@ bool GenerateTaskProgressMarkdown(const std::wstring& task_id,
             if (!r.time.empty()) md << r.time << L" ";
             md << r.title << L"\n";
             EmitBodyIndented(&md, r.body);
+            md << L"\n";
           }
           md << L"\n";
         }

@@ -84,6 +84,9 @@ enum : int {
   IDC_BTN_SAVE = 2011,
   IDC_BTN_DEL = 2012,
   IDC_BTN_PREVIEW = 2013,
+  IDC_GRP_OFFICE = 2060,
+  IDC_BTN_SCREENSHOT = 2061,
+  IDC_BTN_QUICK_REPLY = 2062,
   IDC_STATUS = 2020,
   IDC_CB_STATUS = 2021,
   IDC_LBL_CATEGORY = 2030,
@@ -112,6 +115,9 @@ struct AppState {
   HWND cal{};
   HWND st_day{};
   HWND list{};
+  HWND grp_office{};
+  HWND btn_screenshot{};
+  HWND btn_quick_reply{};
   HWND lbl_category{};
   HWND lbl_start{};
   HWND lbl_end{};
@@ -153,6 +159,13 @@ struct AppState {
   std::vector<Task> tasks;
   std::vector<RecurringMeeting> recurring_meetings;
 };
+
+// Forward declarations used by small UI helpers defined early in this file.
+static std::wstring NormalizeNewlinesToCrlf(const std::wstring& s);
+static bool CopyToClipboard(HWND hwnd, const std::wstring& text);
+static bool WriteUtf8File(const std::wstring& path, const std::wstring& content, std::wstring* err);
+static bool ReadFileUtf8Simple(const std::wstring& path, std::wstring* out, std::wstring* err);
+static void OpenDataDir(AppState* s);
 
 static bool IsEditorTrulyDirty(AppState* s);
 static void SetEditorDirty(AppState* s, bool dirty);
@@ -411,6 +424,122 @@ static void UpdateStatusBar(AppState* s) {
   }
   if (IsEditorTrulyDirty(s)) info += L"  未保存";
   SendMessageW(s->status, SB_SETTEXTW, 0, (LPARAM)info.c_str());
+}
+
+static void DoScreenshot(AppState* s) {
+  if (!s) return;
+  // Try modern screen snip first.
+  HINSTANCE r = ShellExecuteW(nullptr, L"open", L"explorer.exe", L"ms-screenclip:", nullptr, SW_SHOWNORMAL);
+  if ((INT_PTR)r > 32) return;
+
+  // Fallback to classic snipping tool if available.
+  r = ShellExecuteW(nullptr, L"open", L"SnippingTool.exe", nullptr, nullptr, SW_SHOWNORMAL);
+  if ((INT_PTR)r > 32) return;
+
+  ShowInfoBox(s->hwnd, L"无法启动系统截图工具。\n\n你可以尝试：Win + Shift + S", L"提示");
+}
+
+static std::vector<std::wstring> DefaultQuickReplies() {
+  return {
+      L"收到，我看一下。",
+      L"已同步，辛苦。",
+      L"我这边已处理，麻烦再确认一下。",
+      L"这个点我需要再确认一下细节，稍后回复。",
+      L"我建议先这样做：\n- \n- ",
+      L"今日进展：\n- \n\n风险/阻塞：\n- \n\n下一步：\n- ",
+  };
+}
+
+static std::wstring GetQuickRepliesFilePath() {
+  return JoinPath(GetDataRootDir(), L"quick_replies.txt");
+}
+
+static bool LoadQuickReplies(std::vector<std::wstring>* out, std::wstring* err) {
+  if (!out) return false;
+  out->clear();
+
+  EnsureDirExists(GetDataRootDir());
+  std::wstring path = GetQuickRepliesFilePath();
+  if (!FileExists(path)) {
+    *out = DefaultQuickReplies();
+    // Best-effort persist.
+    std::wstring save_err;
+    std::wstring content;
+    for (const auto& r : *out) content += r + L"\n";
+    WriteUtf8File(path, content, &save_err);
+    return true;
+  }
+
+  std::wstring content;
+  if (!ReadFileUtf8Simple(path, &content, err)) return false;
+
+  std::wstring line;
+  std::wstringstream ss(content);
+  while (std::getline(ss, line)) {
+    if (!line.empty() && line.back() == L'\r') line.pop_back();
+    if (line.empty()) continue;
+    out->push_back(line);
+  }
+  if (out->empty()) *out = DefaultQuickReplies();
+  return true;
+}
+
+static void InsertTextIntoBody(AppState* s, const std::wstring& text) {
+  if (!s || !s->ed_body) return;
+  SetFocus(s->ed_body);
+  // RichEdit expects CRLF for newlines.
+  std::wstring t = NormalizeNewlinesToCrlf(text);
+  // Add a trailing newline to avoid sticking to next content.
+  if (!t.empty() && t.back() != L'\n') t += L"\r\n";
+  SendMessageW(s->ed_body, EM_REPLACESEL, TRUE, (LPARAM)t.c_str());
+  SetEditorDirty(s, true);
+  SendMessageW(s->ed_body, EM_SETMODIFY, TRUE, 0);
+  UpdateStatusBar(s);
+}
+
+static void ShowQuickReplyMenu(AppState* s) {
+  if (!s) return;
+
+  std::vector<std::wstring> replies;
+  std::wstring err;
+  if (!LoadQuickReplies(&replies, &err)) {
+    ShowInfoBox(s->hwnd, err.c_str(), L"读取常用回复失败");
+    return;
+  }
+  if (replies.empty()) return;
+
+  enum : UINT { IDM_QR_BASE = 14000 };
+  HMENU menu = CreatePopupMenu();
+  if (!menu) return;
+  UINT id = IDM_QR_BASE;
+  for (const auto& r : replies) {
+    if (id >= IDM_QR_BASE + 200) break;
+    std::wstring one = r;
+    size_t nl = one.find(L'\n');
+    if (nl != std::wstring::npos) one = one.substr(0, nl) + L" ...";
+    if (one.size() > 60) one = one.substr(0, 60) + L"...";
+    AppendMenuW(menu, MF_STRING, id++, one.c_str());
+  }
+  AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(menu, MF_STRING, IDM_QR_BASE + 1000, L"打开 quick_replies.txt 所在数据目录");
+
+  POINT pt{};
+  GetCursorPos(&pt);
+  UINT cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, s->hwnd, nullptr);
+  DestroyMenu(menu);
+  if (!cmd) return;
+
+  if (cmd == IDM_QR_BASE + 1000) {
+    OpenDataDir(s);
+    return;
+  }
+
+  size_t idx = (size_t)(cmd - IDM_QR_BASE);
+  if (idx >= replies.size()) return;
+
+  std::wstring t = replies[idx];
+  CopyToClipboard(s->hwnd, NormalizeNewlinesToCrlf(t));
+  if (s->ed_body) InsertTextIntoBody(s, t);
 }
 
 static void ApplyBodyFormatting(AppState* s, void (*fn)(HWND)) {
@@ -1695,6 +1824,19 @@ static std::wstring FormatWin32ErrorMessage(DWORD err) {
   return msg;
 }
 
+static std::wstring NormalizeNewlinesToCrlf(const std::wstring& s) {
+  // Windows EDIT control and many clipboard consumers expect CRLF line endings.
+  std::wstring out;
+  out.reserve(s.size() + 16);
+  wchar_t prev = 0;
+  for (wchar_t ch : s) {
+    if (ch == L'\n' && prev != L'\r') out.push_back(L'\r');
+    out.push_back(ch);
+    prev = ch;
+  }
+  return out;
+}
+
 static bool PickFolderDialog(HWND owner, const wchar_t* title, std::wstring* out_path) {
   if (out_path) out_path->clear();
 
@@ -2385,7 +2527,7 @@ static void ShowReportWindow(HWND owner, const std::wstring& title, const std::w
   RegisterClassW(&wc);
 
   ReportWindowState state{};
-  state.markdown = md;
+  state.markdown = NormalizeNewlinesToCrlf(md);
   state.default_name = default_name;
 
   HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, wc.lpszClassName, title.c_str(),
@@ -2650,7 +2792,7 @@ static void ShowPreviewWindow(HWND owner, const std::wstring& title, const std::
   RegisterClassW(&wc);
 
   PreviewWindowState state{};
-  state.markdown = markdown;
+  state.markdown = NormalizeNewlinesToCrlf(markdown);
 
   HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, wc.lpszClassName, title.c_str(),
                               WS_OVERLAPPEDWINDOW | WS_VISIBLE,
@@ -4058,6 +4200,19 @@ static void Layout(AppState* s) {
 
   MoveWindow(s->cal, pad, pad, left_w, top_h, TRUE);
 
+  // Left-bottom office panel.
+  int office_y = pad + top_h + pad;
+  int office_h = h - office_y - pad;
+  if (office_h < ScalePx(s->hwnd, 120)) office_h = ScalePx(s->hwnd, 120);
+  MoveWindow(s->grp_office, pad, office_y, left_w, office_h, TRUE);
+  int oy = office_y + ScalePx(s->hwnd, 24);
+  int obh = ScalePx(s->hwnd, 30);
+  int obw = left_w - 2 * ScalePx(s->hwnd, 10);
+  int ox = pad + ScalePx(s->hwnd, 10);
+  MoveWindow(s->btn_screenshot, ox, oy, obw, obh, TRUE);
+  oy += obh + ScalePx(s->hwnd, 8);
+  MoveWindow(s->btn_quick_reply, ox, oy, obw, obh, TRUE);
+
   int right_x = pad + left_w + pad;
   int right_w = w - right_x - pad;
   int y = pad;
@@ -4349,13 +4504,25 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                                   WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
                                   0, 0, 0, 0, hwnd, (HMENU)IDC_STATUS, nullptr, nullptr);
 
+      // Left-bottom "office" helpers.
+      s->grp_office = CreateWindowExW(0, L"BUTTON", L"办公",
+                                      WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+                                      0, 0, 10, 10, hwnd, (HMENU)IDC_GRP_OFFICE, nullptr, nullptr);
+      s->btn_screenshot = CreateWindowExW(0, L"BUTTON", L"截图",
+                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                          0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_SCREENSHOT, nullptr, nullptr);
+      s->btn_quick_reply = CreateWindowExW(0, L"BUTTON", L"常用回复",
+                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                           0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_QUICK_REPLY, nullptr, nullptr);
+
       // Fonts
       for (HWND h : {s->cal, s->st_day, s->list, s->lbl_category, s->lbl_start, s->lbl_end, s->lbl_title, s->lbl_body,
                      s->lbl_status, s->cb_category, s->ed_start, s->ed_end, s->cb_status, s->ed_title,
                      s->fmt_bold, s->fmt_italic, s->fmt_underline, s->fmt_numbering, s->fmt_bullet,
                      s->fmt_align_left, s->fmt_align_center, s->fmt_align_right, s->fmt_indent_inc, s->fmt_indent_dec, s->fmt_clear,
                      s->ed_body, s->status,
-                     s->btn_new, s->btn_save, s->btn_preview, s->btn_del}) {
+                     s->btn_new, s->btn_save, s->btn_preview, s->btn_del,
+                     s->grp_office, s->btn_screenshot, s->btn_quick_reply}) {
         SetControlFont(h, s->font);
       }
 
@@ -4436,6 +4603,14 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       if (id == IDC_BTN_DEL && code == BN_CLICKED) {
         int r = MessageBoxW(hwnd, L"确定删除当前条目？", kAppTitle, MB_YESNO | MB_ICONWARNING);
         if (r == IDYES) DeleteCurrent(s);
+        return 0;
+      }
+      if (id == IDC_BTN_SCREENSHOT && code == BN_CLICKED) {
+        DoScreenshot(s);
+        return 0;
+      }
+      if (id == IDC_BTN_QUICK_REPLY && code == BN_CLICKED) {
+        ShowQuickReplyMenu(s);
         return 0;
       }
 

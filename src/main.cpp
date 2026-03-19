@@ -6,6 +6,7 @@
 #include "recurring.h"
 #include "types.h"
 #include "win32_util.h"
+#include "screenshot_tool.h"
 
 #include <commctrl.h>
 #include <commdlg.h>
@@ -17,6 +18,7 @@
 
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <cwctype>
 #include <cstring>
 #include <sstream>
@@ -87,6 +89,10 @@ enum : int {
   IDC_GRP_OFFICE = 2060,
   IDC_BTN_SCREENSHOT = 2061,
   IDC_BTN_QUICK_REPLY = 2062,
+  IDC_BTN_TIMESTAMP = 2063,
+  IDC_BTN_FOCUS_TIMER = 2064,
+  IDC_BTN_CALC = 2065,
+  IDC_BTN_DATA_DIR = 2066,
   IDC_STATUS = 2020,
   IDC_CB_STATUS = 2021,
   IDC_LBL_CATEGORY = 2030,
@@ -118,6 +124,10 @@ struct AppState {
   HWND grp_office{};
   HWND btn_screenshot{};
   HWND btn_quick_reply{};
+  HWND btn_timestamp{};
+  HWND btn_focus_timer{};
+  HWND btn_calc{};
+  HWND btn_data_dir{};
   HWND lbl_category{};
   HWND lbl_start{};
   HWND lbl_end{};
@@ -154,6 +164,15 @@ struct AppState {
   bool editor_dirty{false};
   bool ignore_cal_selchange{false};  // avoid repeated prompts when we programmatically revert calendar selection
   bool suppress_dirty_prompt{false};  // avoid re-entrant prompts triggered by programmatic UI updates while saving
+
+  // Small "toast" messages shown in the status bar (e.g. "copied to clipboard").
+  std::wstring toast;
+  ULONGLONG toast_until{0};
+
+  // Focus timer (pomodoro-like, offline).
+  bool focus_running{false};
+  ULONGLONG focus_end_tick{0};
+  UINT_PTR focus_timer_id{0};
 
   std::vector<std::wstring> categories;
   std::vector<Task> tasks;
@@ -413,6 +432,12 @@ static void UpdateStatusBar(AppState* s) {
   std::wstring hint = L"快捷键: Ctrl+S 保存  Ctrl+N 新增  Ctrl+P 预览  Ctrl+K 分类  Ctrl+T 长期任务  Ctrl+R 周期会议  F1 帮助";
   SendMessageW(s->status, SB_SETTEXTW, 1, (LPARAM)hint.c_str());
 
+  ULONGLONG now = GetTickCount64();
+  if (now < s->toast_until && !s->toast.empty()) {
+    SendMessageW(s->status, SB_SETTEXTW, 0, (LPARAM)s->toast.c_str());
+    return;
+  }
+
   std::wstring info = FormatDateYYYYMMDD(s->selected);
   info += L"  ";
   if (s->editing_index >= 0) {
@@ -423,20 +448,106 @@ static void UpdateStatusBar(AppState* s) {
     info += L"(新建)";
   }
   if (IsEditorTrulyDirty(s)) info += L"  未保存";
+
+  if (s->focus_running) {
+    ULONGLONG remain = (s->focus_end_tick > now) ? (s->focus_end_tick - now) : 0;
+    int sec = (int)(remain / 1000);
+    int mm = sec / 60;
+    int ss = sec % 60;
+    wchar_t buf[64]{};
+    wsprintfW(buf, L"  专注 %02d:%02d", mm, ss);
+    info += buf;
+  }
   SendMessageW(s->status, SB_SETTEXTW, 0, (LPARAM)info.c_str());
 }
 
-static void DoScreenshot(AppState* s) {
+static void ShowToast(AppState* s, const std::wstring& msg, int ms = 2200) {
   if (!s) return;
-  // Try modern screen snip first.
-  HINSTANCE r = ShellExecuteW(nullptr, L"open", L"explorer.exe", L"ms-screenclip:", nullptr, SW_SHOWNORMAL);
-  if ((INT_PTR)r > 32) return;
+  s->toast = msg;
+  s->toast_until = GetTickCount64() + (ULONGLONG)std::max(500, ms);
+  UpdateStatusBar(s);
+}
 
-  // Fallback to classic snipping tool if available.
-  r = ShellExecuteW(nullptr, L"open", L"SnippingTool.exe", nullptr, nullptr, SW_SHOWNORMAL);
-  if ((INT_PTR)r > 32) return;
+static void DrawOfficeButton(const DRAWITEMSTRUCT* di) {
+  if (!di || di->CtlType != ODT_BUTTON) return;
+  HDC dc = di->hDC;
+  RECT r = di->rcItem;
 
-  ShowInfoBox(s->hwnd, L"无法启动系统截图工具。\n\n你可以尝试：Win + Shift + S", L"提示");
+  bool disabled = (di->itemState & ODS_DISABLED) != 0;
+  bool pressed = (di->itemState & ODS_SELECTED) != 0;
+  bool focused = (di->itemState & ODS_FOCUS) != 0;
+
+  COLORREF bg = disabled ? RGB(245, 245, 245) : (pressed ? RGB(225, 240, 255) : RGB(248, 249, 251));
+  COLORREF border = disabled ? RGB(215, 215, 215) : (pressed ? RGB(0, 120, 215) : RGB(206, 210, 216));
+  COLORREF text = disabled ? RGB(150, 150, 150) : RGB(25, 25, 25);
+
+  // Outer rounded rect.
+  HBRUSH br = CreateSolidBrush(bg);
+  HPEN pen = CreatePen(PS_SOLID, 1, border);
+  HGDIOBJ ob = SelectObject(dc, br);
+  HGDIOBJ op = SelectObject(dc, pen);
+  SetBkMode(dc, TRANSPARENT);
+
+  RECT rr = r;
+  InflateRect(&rr, -1, -1);
+  RoundRect(dc, rr.left, rr.top, rr.right, rr.bottom, 10, 10);
+
+  // Label.
+  wchar_t buf[256]{};
+  GetWindowTextW(di->hwndItem, buf, (int)(sizeof(buf) / sizeof(buf[0])));
+  SetTextColor(dc, text);
+  RECT tr = rr;
+  InflateRect(&tr, -8, -2);
+  DrawTextW(dc, buf, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+  if (focused && !disabled) {
+    RECT fr = rr;
+    InflateRect(&fr, -3, -3);
+    DrawFocusRect(dc, &fr);
+  }
+
+  SelectObject(dc, op);
+  SelectObject(dc, ob);
+  DeleteObject(pen);
+  DeleteObject(br);
+}
+
+static void UpdateFocusTimerButton(AppState* s) {
+  if (!s || !s->btn_focus_timer) return;
+  if (!s->focus_running) {
+    SetWindowTextW(s->btn_focus_timer, L"专注 25:00");
+    return;
+  }
+  ULONGLONG now = GetTickCount64();
+  ULONGLONG remain = (s->focus_end_tick > now) ? (s->focus_end_tick - now) : 0;
+  int sec = (int)(remain / 1000);
+  int mm = sec / 60;
+  int ss = sec % 60;
+  wchar_t buf[64]{};
+  wsprintfW(buf, L"停止 %02d:%02d", mm, ss);
+  SetWindowTextW(s->btn_focus_timer, buf);
+}
+
+static void StopFocusTimer(AppState* s) {
+  if (!s) return;
+  if (s->focus_timer_id) {
+    KillTimer(s->hwnd, s->focus_timer_id);
+    s->focus_timer_id = 0;
+  }
+  s->focus_running = false;
+  s->focus_end_tick = 0;
+  UpdateFocusTimerButton(s);
+  UpdateStatusBar(s);
+}
+
+static void StartFocusTimer(AppState* s, int minutes) {
+  if (!s) return;
+  ULONGLONG now = GetTickCount64();
+  s->focus_running = true;
+  s->focus_end_tick = now + (ULONGLONG)minutes * 60ull * 1000ull;
+  if (!s->focus_timer_id) s->focus_timer_id = SetTimer(s->hwnd, 1, 250, nullptr);
+  UpdateFocusTimerButton(s);
+  UpdateStatusBar(s);
 }
 
 static std::vector<std::wstring> DefaultQuickReplies() {
@@ -454,6 +565,65 @@ static std::wstring GetQuickRepliesFilePath() {
   return JoinPath(GetDataRootDir(), L"quick_replies.txt");
 }
 
+static std::vector<std::wstring> ParseQuickRepliesContent(const std::wstring& content) {
+  // New format (recommended): blocks separated by a line that is exactly "---".
+  // This supports multi-line replies and blank lines.
+  bool has_sep = false;
+  {
+    std::wstringstream ss(content);
+    std::wstring line;
+    while (std::getline(ss, line)) {
+      if (!line.empty() && line.back() == L'\r') line.pop_back();
+      if (line == L"---") {
+        has_sep = true;
+        break;
+      }
+    }
+  }
+
+  std::vector<std::wstring> out;
+  if (has_sep) {
+    std::wstringstream ss(content);
+    std::wstring line;
+    std::wstring cur;
+    while (std::getline(ss, line)) {
+      if (!line.empty() && line.back() == L'\r') line.pop_back();
+      if (line == L"---") {
+        while (!cur.empty() && (cur.back() == L'\n' || cur.back() == L'\r')) cur.pop_back();
+        if (!cur.empty()) out.push_back(cur);
+        cur.clear();
+        continue;
+      }
+      cur += line;
+      cur += L"\n";
+    }
+    while (!cur.empty() && (cur.back() == L'\n' || cur.back() == L'\r')) cur.pop_back();
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+  }
+
+  // Legacy format: each non-empty line is a reply (single-line only).
+  std::wstringstream ss(content);
+  std::wstring line;
+  while (std::getline(ss, line)) {
+    if (!line.empty() && line.back() == L'\r') line.pop_back();
+    if (line.empty()) continue;
+    out.push_back(line);
+  }
+  return out;
+}
+
+static std::wstring SerializeQuickReplies(const std::vector<std::wstring>& replies) {
+  // Always write in block format to preserve multi-line replies.
+  std::wstring out;
+  for (size_t i = 0; i < replies.size(); i++) {
+    out += replies[i];
+    if (out.empty() || out.back() != L'\n') out += L"\n";
+    out += L"---\n";
+  }
+  return out;
+}
+
 static bool LoadQuickReplies(std::vector<std::wstring>* out, std::wstring* err) {
   if (!out) return false;
   out->clear();
@@ -464,22 +634,14 @@ static bool LoadQuickReplies(std::vector<std::wstring>* out, std::wstring* err) 
     *out = DefaultQuickReplies();
     // Best-effort persist.
     std::wstring save_err;
-    std::wstring content;
-    for (const auto& r : *out) content += r + L"\n";
-    WriteUtf8File(path, content, &save_err);
+    WriteUtf8File(path, SerializeQuickReplies(*out), &save_err);
     return true;
   }
 
   std::wstring content;
   if (!ReadFileUtf8Simple(path, &content, err)) return false;
 
-  std::wstring line;
-  std::wstringstream ss(content);
-  while (std::getline(ss, line)) {
-    if (!line.empty() && line.back() == L'\r') line.pop_back();
-    if (line.empty()) continue;
-    out->push_back(line);
-  }
+  *out = ParseQuickRepliesContent(content);
   if (out->empty()) *out = DefaultQuickReplies();
   return true;
 }
@@ -521,6 +683,7 @@ static void ShowQuickReplyMenu(AppState* s) {
     AppendMenuW(menu, MF_STRING, id++, one.c_str());
   }
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(menu, MF_STRING, IDM_QR_BASE + 999, L"编辑 quick_replies.txt");
   AppendMenuW(menu, MF_STRING, IDM_QR_BASE + 1000, L"打开 quick_replies.txt 所在数据目录");
 
   POINT pt{};
@@ -529,6 +692,11 @@ static void ShowQuickReplyMenu(AppState* s) {
   DestroyMenu(menu);
   if (!cmd) return;
 
+  if (cmd == IDM_QR_BASE + 999) {
+    std::wstring path = GetQuickRepliesFilePath();
+    ShellExecuteW(nullptr, L"open", L"notepad.exe", path.c_str(), nullptr, SW_SHOWNORMAL);
+    return;
+  }
   if (cmd == IDM_QR_BASE + 1000) {
     OpenDataDir(s);
     return;
@@ -539,7 +707,7 @@ static void ShowQuickReplyMenu(AppState* s) {
 
   std::wstring t = replies[idx];
   CopyToClipboard(s->hwnd, NormalizeNewlinesToCrlf(t));
-  if (s->ed_body) InsertTextIntoBody(s, t);
+  ShowToast(s, L"常用回复已复制到剪贴板");
 }
 
 static void ApplyBodyFormatting(AppState* s, void (*fn)(HWND)) {
@@ -4205,13 +4373,24 @@ static void Layout(AppState* s) {
   int office_h = h - office_y - pad;
   if (office_h < ScalePx(s->hwnd, 120)) office_h = ScalePx(s->hwnd, 120);
   MoveWindow(s->grp_office, pad, office_y, left_w, office_h, TRUE);
-  int oy = office_y + ScalePx(s->hwnd, 24);
-  int obh = ScalePx(s->hwnd, 30);
-  int obw = left_w - 2 * ScalePx(s->hwnd, 10);
-  int ox = pad + ScalePx(s->hwnd, 10);
-  MoveWindow(s->btn_screenshot, ox, oy, obw, obh, TRUE);
-  oy += obh + ScalePx(s->hwnd, 8);
-  MoveWindow(s->btn_quick_reply, ox, oy, obw, obh, TRUE);
+  int inner = ScalePx(s->hwnd, 10);
+  int gap = ScalePx(s->hwnd, 8);
+  int oy0 = office_y + ScalePx(s->hwnd, 26);
+  int ox0 = pad + inner;
+  int cols = 2;
+  int bh = ScalePx(s->hwnd, 32);
+  int bw = (left_w - 2 * inner - gap) / cols;
+  std::vector<HWND> btns = {s->btn_screenshot, s->btn_quick_reply, s->btn_timestamp, s->btn_focus_timer, s->btn_calc,
+                            s->btn_data_dir};
+  for (size_t i = 0; i < btns.size(); i++) {
+    HWND b = btns[i];
+    if (!b) continue;
+    int row = (int)(i / cols);
+    int col = (int)(i % cols);
+    int x = ox0 + col * (bw + gap);
+    int yb = oy0 + row * (bh + gap);
+    MoveWindow(b, x, yb, bw, bh, TRUE);
+  }
 
   int right_x = pad + left_w + pad;
   int right_w = w - right_x - pad;
@@ -4508,12 +4687,25 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       s->grp_office = CreateWindowExW(0, L"BUTTON", L"办公",
                                       WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
                                       0, 0, 10, 10, hwnd, (HMENU)IDC_GRP_OFFICE, nullptr, nullptr);
+      DWORD office_btn_style = WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP;
       s->btn_screenshot = CreateWindowExW(0, L"BUTTON", L"截图",
-                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                          office_btn_style,
                                           0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_SCREENSHOT, nullptr, nullptr);
       s->btn_quick_reply = CreateWindowExW(0, L"BUTTON", L"常用回复",
-                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                           office_btn_style,
                                            0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_QUICK_REPLY, nullptr, nullptr);
+      s->btn_timestamp = CreateWindowExW(0, L"BUTTON", L"复制时间戳",
+                                         office_btn_style,
+                                         0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_TIMESTAMP, nullptr, nullptr);
+      s->btn_focus_timer = CreateWindowExW(0, L"BUTTON", L"专注 25:00",
+                                           office_btn_style,
+                                           0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_FOCUS_TIMER, nullptr, nullptr);
+      s->btn_calc = CreateWindowExW(0, L"BUTTON", L"计算器",
+                                    office_btn_style,
+                                    0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_CALC, nullptr, nullptr);
+      s->btn_data_dir = CreateWindowExW(0, L"BUTTON", L"数据目录",
+                                        office_btn_style,
+                                        0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_DATA_DIR, nullptr, nullptr);
 
       // Fonts
       for (HWND h : {s->cal, s->st_day, s->list, s->lbl_category, s->lbl_start, s->lbl_end, s->lbl_title, s->lbl_body,
@@ -4521,8 +4713,9 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                      s->fmt_bold, s->fmt_italic, s->fmt_underline, s->fmt_numbering, s->fmt_bullet,
                      s->fmt_align_left, s->fmt_align_center, s->fmt_align_right, s->fmt_indent_inc, s->fmt_indent_dec, s->fmt_clear,
                      s->ed_body, s->status,
-                     s->btn_new, s->btn_save, s->btn_preview, s->btn_del,
-                     s->grp_office, s->btn_screenshot, s->btn_quick_reply}) {
+                      s->btn_new, s->btn_save, s->btn_preview, s->btn_del,
+                     s->grp_office, s->btn_screenshot, s->btn_quick_reply, s->btn_timestamp, s->btn_focus_timer, s->btn_calc,
+                     s->btn_data_dir}) {
         SetControlFont(h, s->font);
       }
 
@@ -4583,6 +4776,34 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       return 0;
     }
 
+    case WM_TIMER: {
+      if (!s) return 0;
+      if (s->focus_running && wParam == s->focus_timer_id) {
+        ULONGLONG now = GetTickCount64();
+        if (now >= s->focus_end_tick) {
+          StopFocusTimer(s);
+          MessageBeep(MB_ICONASTERISK);
+          ShowToast(s, L"专注计时结束");
+          MessageBoxW(hwnd, L"专注计时结束。", kAppTitle, MB_OK | MB_ICONINFORMATION);
+          return 0;
+        }
+        UpdateFocusTimerButton(s);
+        UpdateStatusBar(s);
+        return 0;
+      }
+      return 0;
+    }
+
+    case WM_DRAWITEM: {
+      int id = (int)wParam;
+      if (id == IDC_BTN_SCREENSHOT || id == IDC_BTN_QUICK_REPLY || id == IDC_BTN_TIMESTAMP || id == IDC_BTN_FOCUS_TIMER ||
+          id == IDC_BTN_CALC || id == IDC_BTN_DATA_DIR) {
+        DrawOfficeButton(reinterpret_cast<const DRAWITEMSTRUCT*>(lParam));
+        return TRUE;
+      }
+      break;
+    }
+
     case WM_COMMAND: {
       int id = LOWORD(wParam);
       int code = HIWORD(wParam);
@@ -4606,11 +4827,39 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
       }
       if (id == IDC_BTN_SCREENSHOT && code == BN_CLICKED) {
-        DoScreenshot(s);
+        StartScreenshotTool(s->hwnd);
         return 0;
       }
       if (id == IDC_BTN_QUICK_REPLY && code == BN_CLICKED) {
         ShowQuickReplyMenu(s);
+        return 0;
+      }
+      if (id == IDC_BTN_TIMESTAMP && code == BN_CLICKED) {
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        wchar_t buf[64]{};
+        wsprintfW(buf, L"%04d-%02d-%02d %02d:%02d", (int)st.wYear, (int)st.wMonth, (int)st.wDay, (int)st.wHour, (int)st.wMinute);
+        CopyToClipboard(s->hwnd, buf);
+        ShowToast(s, L"时间戳已复制到剪贴板");
+        return 0;
+      }
+      if (id == IDC_BTN_FOCUS_TIMER && code == BN_CLICKED) {
+        if (s->focus_running) {
+          StopFocusTimer(s);
+          ShowToast(s, L"已停止专注计时");
+        } else {
+          StartFocusTimer(s, 25);
+          ShowToast(s, L"已开始专注计时 25 分钟");
+        }
+        return 0;
+      }
+      if (id == IDC_BTN_CALC && code == BN_CLICKED) {
+        HINSTANCE r = ShellExecuteW(nullptr, L"open", L"calc.exe", nullptr, nullptr, SW_SHOWNORMAL);
+        if ((INT_PTR)r <= 32) ShowInfoBox(s->hwnd, L"无法启动计算器(calc.exe)。", L"提示");
+        return 0;
+      }
+      if (id == IDC_BTN_DATA_DIR && code == BN_CLICKED) {
+        OpenDataDir(s);
         return 0;
       }
 
@@ -5042,6 +5291,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     }
 
     case WM_DESTROY: {
+      if (s) StopFocusTimer(s);
       if (s && s->font) DeleteObject(s->font);
       PostQuitMessage(0);
       return 0;

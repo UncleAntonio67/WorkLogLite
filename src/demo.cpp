@@ -1,7 +1,6 @@
 #include "demo.h"
 
 #include "categories.h"
-#include "recurring.h"
 #include "storage.h"
 #include "tasks.h"
 #include "win32_util.h"
@@ -86,6 +85,7 @@ static Task MakeDemoTask(const std::wstring& id,
   return t;
 }
 
+#if 0  // Recurring meetings removed from app; keep demo generator code disabled for reference.
 static RecurringMeeting MakeDemoRecurring(const std::wstring& id,
                                          const std::wstring& cat,
                                          const std::wstring& title,
@@ -134,6 +134,7 @@ static void AddOrUpdateDemoRecurring(std::vector<RecurringMeeting>* ms, const Re
   }
   ms->push_back(m);
 }
+#endif  // 0
 
 static void AddOrUpdateDemoTask(std::vector<Task>* tasks, const Task& t) {
   if (!tasks) return;
@@ -160,11 +161,13 @@ bool GenerateDemoData(const SYSTEMTIME& anchor, std::wstring* err) {
     LoadTasks(&tasks, &terr);
   }
 
+#if 0
   std::vector<RecurringMeeting> rec;
   {
     std::wstring rerr;
     LoadRecurringMeetings(&rec, &rerr);
   }
+#endif
 
   // Categories aligned with realistic daily work.
   for (const auto& c : std::vector<std::wstring>{
@@ -258,7 +261,8 @@ bool GenerateDemoData(const SYSTEMTIME& anchor, std::wstring* err) {
     }
   }
 
-  // Recurring meetings (weekly cadence) with templates.
+  // Recurring meetings (weekly cadence) with templates. (Disabled: feature removed)
+#if 0
   {
     RecurringMeeting standup = MakeDemoRecurring(
         L"demo-rec-standup",
@@ -345,6 +349,7 @@ bool GenerateDemoData(const SYSTEMTIME& anchor, std::wstring* err) {
       return false;
     }
   }
+#endif
 
   // Add a selection of daily entries (meetings + progress + misc).
   for (SYSTEMTIME d = start; DateLeq(d, end); d = AddDays(d, 1)) {

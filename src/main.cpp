@@ -3,7 +3,6 @@
 #include "report.h"
 #include "storage.h"
 #include "tasks.h"
-#include "recurring.h"
 #include "types.h"
 #include "win32_util.h"
 #include "screenshot_tool.h"
@@ -47,7 +46,6 @@ enum : UINT {
   IDM_PREVIEW_ENTRY = 1020,
   IDM_PREVIEW_DAY = 1021,
   IDM_MANAGE_TASKS = 1030,
-  IDM_MANAGE_RECURRING_MEETINGS = 1040,
   IDM_GENERATE_DEMO_DATA = 1050,
   IDM_CHANGE_PASSWORD = 1060,
   IDM_DISABLE_PASSWORD_LOGIN = 1061,
@@ -56,8 +54,8 @@ enum : UINT {
 
   // Context menu (ListView)
   IDM_CTX_CREATE_TASK_FROM_MEETING = 20001,
-  IDM_CTX_INSERT_MEETING_TEMPLATE = 20002,
   IDM_CTX_VIEW_TASK_PROGRESS = 20003,
+  IDM_CTX_OPEN_TASK_MATERIALS_DIR = 20004,
 
   // Formatting (RichEdit body)
   IDM_FMT_BOLD = 30001,
@@ -93,6 +91,8 @@ enum : int {
   IDC_BTN_FOCUS_TIMER = 2064,
   IDC_BTN_CALC = 2065,
   IDC_BTN_DATA_DIR = 2066,
+  IDC_BTN_SCREENSHOT_DIR = 2067,
+  IDC_BTN_TASK_MATERIALS_ROOT = 2068,
   IDC_STATUS = 2020,
   IDC_CB_STATUS = 2021,
   IDC_LBL_CATEGORY = 2030,
@@ -128,6 +128,8 @@ struct AppState {
   HWND btn_focus_timer{};
   HWND btn_calc{};
   HWND btn_data_dir{};
+  HWND btn_screenshot_dir{};
+  HWND btn_task_materials{};
   HWND lbl_category{};
   HWND lbl_start{};
   HWND lbl_end{};
@@ -176,7 +178,6 @@ struct AppState {
 
   std::vector<std::wstring> categories;
   std::vector<Task> tasks;
-  std::vector<RecurringMeeting> recurring_meetings;
 };
 
 // Forward declarations used by small UI helpers defined early in this file.
@@ -429,7 +430,7 @@ static void UpdateDayHeader(AppState* s) {
 static void UpdateStatusBar(AppState* s) {
   if (!s->status) return;
   // Part 1 is a static hint; part 0 is dynamic info.
-  std::wstring hint = L"快捷键: Ctrl+S 保存  Ctrl+N 新增  Ctrl+P 预览  Ctrl+K 分类  Ctrl+T 长期任务  Ctrl+R 周期会议  F1 帮助";
+  std::wstring hint = L"快捷键: Ctrl+S 保存  Ctrl+N 新增  Ctrl+P 预览  Ctrl+K 分类  Ctrl+T 长期任务  F1 帮助";
   SendMessageW(s->status, SB_SETTEXTW, 1, (LPARAM)hint.c_str());
 
   ULONGLONG now = GetTickCount64();
@@ -944,35 +945,6 @@ static bool LoadSelectedDay(AppState* s, const SYSTEMTIME& date) {
   }
   s->selected = date;
   s->day = dd;
-
-  // Inject recurring meetings as placeholders (not persisted unless saved).
-  if (!s->recurring_meetings.empty()) {
-    std::vector<std::wstring> existing_titles;
-    existing_titles.reserve(s->day.entries.size());
-    for (const auto& e : s->day.entries) {
-      if (e.type == EntryType::Meeting) existing_titles.push_back(e.title);
-    }
-    for (const auto& rm : s->recurring_meetings) {
-      if (!RecurringMeetingOccursOn(rm, date)) continue;
-      bool found = false;
-      for (const auto& t : existing_titles) {
-        if (t == rm.title) { found = true; break; }
-      }
-      if (found) continue;
-
-      Entry e{};
-      e.id = L"rec-" + rm.id;
-      e.placeholder = true;
-      e.type = EntryType::Meeting;
-      e.category = rm.category.empty() ? L"会议" : rm.category;
-      e.title = rm.title;
-      e.start_time = rm.start_time;
-      e.end_time = rm.end_time;
-      // Pre-fill template for easier note taking. It is still a placeholder and will not persist unless user saves.
-      if (!rm.template_plain.empty()) e.body_plain = rm.template_plain;
-      s->day.entries.push_back(std::move(e));
-    }
-  }
 
   // Inject active long-term tasks as placeholder entries (not persisted unless edited/saved).
   if (!s->tasks.empty()) {
@@ -2193,7 +2165,7 @@ static void ExportFullData(AppState* s) {
     return;
   }
 
-  std::wstring done = L"已导出到：\n" + dst + L"\n\n说明：这是完整数据目录的原样拷贝（包含日数据、分类、长期任务、周期会议、密码设置等）。";
+  std::wstring done = L"已导出到：\n" + dst + L"\n\n说明：这是完整数据目录的原样拷贝（包含日数据、分类、长期任务、密码设置等）。";
   ShowInfoBox(s->hwnd, done.c_str(), L"导出完成");
 }
 
@@ -2205,7 +2177,7 @@ static void ImportFullData(AppState* s) {
 
   std::wstring src_root = ResolveImportDataRoot(pick);
   if (src_root.empty()) {
-    ShowInfoBox(s->hwnd, L"所选文件夹看起来不像 WorkLogLite 的数据目录。\n\n请选中：包含 categories.txt / tasks.wlt / recurring_meetings.wlrp / auth.wla 或 YYYY\\MM\\YYYY-MM-DD.wlr 的目录。\n\n也支持选择包含 data 子目录的外层文件夹。", L"导入失败");
+    ShowInfoBox(s->hwnd, L"所选文件夹看起来不像 WorkLogLite 的数据目录。\n\n请选中：包含 categories.txt / tasks.wlt / auth.wla 或 YYYY\\MM\\YYYY-MM-DD.wlr 的目录。\n\n也支持选择包含 data 子目录的外层文件夹。", L"导入失败");
     return;
   }
 
@@ -2278,10 +2250,6 @@ static void ImportFullData(AppState* s) {
     std::wstring terr;
     LoadTasks(&s->tasks, &terr);
   }
-  {
-    std::wstring rerr;
-    LoadRecurringMeetings(&s->recurring_meetings, &rerr);
-  }
   LoadSelectedDay(s, s->selected);
 
   std::wstring done = L"导入完成。\n\n当前数据目录已替换。\n备份目录：\n" + backup +
@@ -2311,7 +2279,6 @@ static void ClearAllData(AppState* s) {
       L"- 所有日记录(.wlr)\n"
       L"- 分类(categories.txt)\n"
       L"- 长期任务(tasks.wlt)\n"
-      L"- 周期会议(recurring_meetings.wlrp)\n"
       L"- 密码设置(auth.wla)\n\n"
       L"当前数据目录：\n" + root + L"\n\n"
       L"程序会先把整个目录移动到备份目录(可回滚)：\n" + backup + L"\n\n"
@@ -2343,7 +2310,6 @@ static void ClearAllData(AppState* s) {
     RefreshCategoryCombo(s);
   }
   s->tasks.clear();
-  s->recurring_meetings.clear();
 
   LoadSelectedDay(s, s->selected);
 
@@ -3059,7 +3025,6 @@ static void ShowHelp(AppState* s) {
       L"- 查看 -> 预览: 查看 Markdown 渲染效果。\n"
       L"- 报告 -> 导出 CSV: 直接导出本季度/本年度 CSV，方便 Excel/脚本处理。\n"
       L"- 长期任务: 工具 -> 管理长期任务。任务会在其日期范围内每天自动出现在列表中，方便写进展。\n"
-      L"- 周期会议: 工具 -> 管理周期会议。可设置会议模板，打开当天会自动填入。\n"
       L"- 从会议创建任务: 在会议条目上右键 -> 从此会议创建长期任务。\n"
       L"- 演示数据: 工具 -> 生成示例数据(演示)。\n"
       L"- 密码: 工具 -> 修改密码。若忘记密码，可删除数据目录下的 auth.wla 重置。\n"
@@ -3072,7 +3037,6 @@ static void ShowHelp(AppState* s) {
       L"- Ctrl+Shift+P 预览当天全部\n"
       L"- Ctrl+K 管理分类\n"
       L"- Ctrl+T 管理长期任务\n"
-      L"- Ctrl+R 管理周期会议\n"
       L"- F1 使用说明\n";
   ShowInfoBox(s->hwnd, text, L"WorkLogLite 使用说明");
 }
@@ -3330,6 +3294,7 @@ struct TaskWindowState {
   HWND btn_del{};
   HWND btn_new{};
   HWND btn_save{};
+  HWND btn_open_dir{};
   HWND btn_close{};
   HFONT font{};
 
@@ -3469,13 +3434,25 @@ static std::wstring NewTaskId() {
   return buf;
 }
 
-static const RecurringMeeting* FindRecurringTemplateByTitle(const AppState* s, const std::wstring& title) {
-  if (!s) return nullptr;
-  if (title.empty()) return nullptr;
-  for (const auto& rm : s->recurring_meetings) {
-    if (rm.title == title && !rm.template_plain.empty()) return &rm;
+static std::wstring GetTaskMaterialsRootDir() {
+  std::wstring root = JoinPath(GetDataRootDir(), L"task_materials");
+  EnsureDirExists(root);
+  return root;
+}
+
+static std::wstring GetTaskMaterialsDirById(const std::wstring& task_id) {
+  std::wstring dir = JoinPath(GetTaskMaterialsRootDir(), task_id);
+  EnsureDirExists(dir);
+  return dir;
+}
+
+static void OpenTaskMaterialsDir(HWND owner, const std::wstring& task_id) {
+  if (task_id.empty()) {
+    ShowInfoBox(owner, L"任务ID为空，无法打开材料目录。", L"提示");
+    return;
   }
-  return nullptr;
+  std::wstring dir = GetTaskMaterialsDirById(task_id);
+  ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 static Task BuildTaskFromMeeting(const SYSTEMTIME& meeting_date, const Entry& meeting) {
@@ -3519,6 +3496,7 @@ static void TaskPopulateCategoryCombo(TaskWindowState* s) {
   if (!s->app->categories.empty()) SetWindowTextW(s->cb_category, s->app->categories[0].c_str());
 }
 
+#if 0  // Recurring meetings removed (kept disabled for history; data file may still exist for old users).
 struct RecurringWindowState {
   HWND hwnd{};
   HWND list{};
@@ -3850,16 +3828,18 @@ static LRESULT CALLBACK RecWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
       MoveWindow(s->ed_template, x, y, right_w, tmpl_h, TRUE);
       y += tmpl_h + pad;
 
-      int needed = btn_w * 4 + pad * 3;
+      int needed = btn_w * 5 + pad * 4;
       int bw = btn_w;
       if (right_w < needed) {
-        bw = (right_w - pad * 3) / 4;
+        bw = (right_w - pad * 4) / 5;
         if (bw < ScalePx(hwnd, 70)) bw = ScalePx(hwnd, 70);
       }
       int bx = x;
       MoveWindow(s->btn_new, bx, y, bw, btn_h, TRUE);
       bx += bw + pad;
       MoveWindow(s->btn_save, bx, y, bw, btn_h, TRUE);
+      bx += bw + pad;
+      MoveWindow(s->btn_open_dir, bx, y, bw, btn_h, TRUE);
       bx += bw + pad;
       MoveWindow(s->btn_del, bx, y, bw, btn_h, TRUE);
       bx += bw + pad;
@@ -3999,6 +3979,8 @@ static void ShowManageRecurringMeetingsWindow(AppState* app) {
   SetForegroundWindow(app->hwnd);
 }
 
+#endif  // 0
+
 static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   auto* s = reinterpret_cast<TaskWindowState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
   switch (msg) {
@@ -4070,17 +4052,20 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       s->btn_save = CreateWindowExW(0, L"BUTTON", L"保存",
                                       WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
                                       0, 0, 10, 10, hwnd, (HMENU)8, nullptr, nullptr);
+      s->btn_open_dir = CreateWindowExW(0, L"BUTTON", L"材料目录",
+                                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                        0, 0, 10, 10, hwnd, (HMENU)11, nullptr, nullptr);
       s->btn_del = CreateWindowExW(0, L"BUTTON", L"删除",
                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
                                    0, 0, 10, 10, hwnd, (HMENU)9, nullptr, nullptr);
       s->btn_close = CreateWindowExW(0, L"BUTTON", L"关闭",
-                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                                     0, 0, 10, 10, hwnd, (HMENU)10, nullptr, nullptr);
+                                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                      0, 0, 10, 10, hwnd, (HMENU)10, nullptr, nullptr);
 
       for (HWND h : {s->list, s->lbl_category, s->cb_category, s->lbl_title, s->ed_title, s->lbl_basis, s->ed_basis,
                      s->lbl_start, s->dt_start, s->lbl_end, s->dt_end, s->lbl_status, s->cb_status,
                      s->lbl_desc, s->re_desc,
-                     s->btn_new, s->btn_save, s->btn_del, s->btn_close}) {
+                     s->btn_new, s->btn_save, s->btn_open_dir, s->btn_del, s->btn_close}) {
         SetControlFont(h, s->font);
       }
 
@@ -4260,6 +4245,15 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         TaskFillFieldsFromSelection(s);
         return 0;
       }
+      if (id == 11) {  // open materials dir
+        int idx = TaskGetSelectedIndex(s);
+        if (idx < 0 || idx >= (int)s->working.size()) {
+          ShowInfoBox(hwnd, L"请先在左侧列表选择一个任务。", L"提示");
+          return 0;
+        }
+        OpenTaskMaterialsDir(hwnd, s->working[(size_t)idx].id);
+        return 0;
+      }
       if (id == 9) {  // delete
         int idx = TaskGetSelectedIndex(s);
         if (idx < 0 || idx >= (int)s->working.size()) return 0;
@@ -4380,8 +4374,8 @@ static void Layout(AppState* s) {
   int cols = 2;
   int bh = ScalePx(s->hwnd, 32);
   int bw = (left_w - 2 * inner - gap) / cols;
-  std::vector<HWND> btns = {s->btn_screenshot, s->btn_quick_reply, s->btn_timestamp, s->btn_focus_timer, s->btn_calc,
-                            s->btn_data_dir};
+  std::vector<HWND> btns = {s->btn_screenshot, s->btn_quick_reply, s->btn_timestamp, s->btn_focus_timer,
+                            s->btn_calc, s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials};
   for (size_t i = 0; i < btns.size(); i++) {
     HWND b = btns[i];
     if (!b) continue;
@@ -4534,7 +4528,6 @@ static HMENU CreateAppMenu() {
   AppendMenuW(tools, MF_STRING, IDM_MANAGE_CATEGORIES, L"管理分类...\tCtrl+K");
   AppendMenuW(tools, MF_STRING, IDM_MANAGE_TASKS, L"管理长期任务...\tCtrl+T");
   AppendMenuW(tools, MF_STRING, IDM_VIEW_TASK_PROGRESS, L"查看任务每日进展汇总...");
-  AppendMenuW(tools, MF_STRING, IDM_MANAGE_RECURRING_MEETINGS, L"管理周期会议...\tCtrl+R");
   AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(tools, MF_STRING, IDM_GENERATE_DEMO_DATA, L"生成示例数据(演示)...");
   AppendMenuW(tools, MF_STRING, IDM_CHANGE_PASSWORD, L"修改密码...");
@@ -4706,6 +4699,12 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       s->btn_data_dir = CreateWindowExW(0, L"BUTTON", L"数据目录",
                                         office_btn_style,
                                         0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_DATA_DIR, nullptr, nullptr);
+      s->btn_screenshot_dir = CreateWindowExW(0, L"BUTTON", L"截图目录",
+                                              office_btn_style,
+                                              0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_SCREENSHOT_DIR, nullptr, nullptr);
+      s->btn_task_materials = CreateWindowExW(0, L"BUTTON", L"任务材料",
+                                              office_btn_style,
+                                              0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_TASK_MATERIALS_ROOT, nullptr, nullptr);
 
       // Fonts
       for (HWND h : {s->cal, s->st_day, s->list, s->lbl_category, s->lbl_start, s->lbl_end, s->lbl_title, s->lbl_body,
@@ -4715,7 +4714,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                      s->ed_body, s->status,
                       s->btn_new, s->btn_save, s->btn_preview, s->btn_del,
                      s->grp_office, s->btn_screenshot, s->btn_quick_reply, s->btn_timestamp, s->btn_focus_timer, s->btn_calc,
-                     s->btn_data_dir}) {
+                     s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials}) {
         SetControlFont(h, s->font);
       }
 
@@ -4745,11 +4744,6 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         LoadTasks(&s->tasks, &terr);
       }
 
-      // Load recurring meetings (non-fatal).
-      {
-        std::wstring rerr;
-        LoadRecurringMeetings(&s->recurring_meetings, &rerr);
-      }
 
       // Field hints
       SetEditCue(GetComboEditHandle(s->cb_category), L"例如: 工作 / 会议 / 目标 / 沟通 / 研发");
@@ -4797,7 +4791,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     case WM_DRAWITEM: {
       int id = (int)wParam;
       if (id == IDC_BTN_SCREENSHOT || id == IDC_BTN_QUICK_REPLY || id == IDC_BTN_TIMESTAMP || id == IDC_BTN_FOCUS_TIMER ||
-          id == IDC_BTN_CALC || id == IDC_BTN_DATA_DIR) {
+          id == IDC_BTN_CALC || id == IDC_BTN_DATA_DIR || id == IDC_BTN_SCREENSHOT_DIR || id == IDC_BTN_TASK_MATERIALS_ROOT) {
         DrawOfficeButton(reinterpret_cast<const DRAWITEMSTRUCT*>(lParam));
         return TRUE;
       }
@@ -4860,6 +4854,17 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       }
       if (id == IDC_BTN_DATA_DIR && code == BN_CLICKED) {
         OpenDataDir(s);
+        return 0;
+      }
+      if (id == IDC_BTN_SCREENSHOT_DIR && code == BN_CLICKED) {
+        std::wstring dir = JoinPath(GetDataRootDir(), L"screenshots");
+        EnsureDirExists(dir);
+        ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        return 0;
+      }
+      if (id == IDC_BTN_TASK_MATERIALS_ROOT && code == BN_CLICKED) {
+        std::wstring dir = GetTaskMaterialsRootDir();
+        ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         return 0;
       }
 
@@ -5021,32 +5026,20 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         LoadSelectedDay(s, s->selected);
         return 0;
       }
-      if (id == IDM_MANAGE_RECURRING_MEETINGS) {
-        if (!PromptSaveIfDirty(s)) return 0;
-        ShowManageRecurringMeetingsWindow(s);
-        LoadSelectedDay(s, s->selected);
-        return 0;
-      }
-      if (id == IDM_CTX_INSERT_MEETING_TEMPLATE) {
-        int sel = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
-        if (sel < 0 || sel >= (int)s->day.entries.size()) return 0;
-        Entry& e = s->day.entries[(size_t)sel];
-        if (e.type != EntryType::Meeting) return 0;
-        const RecurringMeeting* rm = FindRecurringTemplateByTitle(s, e.title);
-        if (!rm || rm->template_plain.empty()) return 0;
-
-        SetEditText(s->ed_body, rm->template_plain);
-        SetEditorDirty(s, true);
-        UpdateStatusBar(s);
-        SetFocus(s->ed_body);
-        return 0;
-      }
       if (id == IDM_CTX_VIEW_TASK_PROGRESS) {
         int sel = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
         if (sel < 0 || sel >= (int)s->day.entries.size()) return 0;
         const Entry& e = s->day.entries[(size_t)sel];
         if (e.type != EntryType::TaskProgress || e.task_id.empty()) return 0;
         ViewTaskProgressSummary(s, e.task_id);
+        return 0;
+      }
+      if (id == IDM_CTX_OPEN_TASK_MATERIALS_DIR) {
+        int sel = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
+        if (sel < 0 || sel >= (int)s->day.entries.size()) return 0;
+        const Entry& e = s->day.entries[(size_t)sel];
+        if (e.type != EntryType::TaskProgress || e.task_id.empty()) return 0;
+        OpenTaskMaterialsDir(s->hwnd, e.task_id);
         return 0;
       }
       if (id == IDM_CTX_CREATE_TASK_FROM_MEETING) {
@@ -5092,10 +5085,6 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         {
           std::wstring terr;
           LoadTasks(&s->tasks, &terr);
-        }
-        {
-          std::wstring rerr;
-          LoadRecurringMeetings(&s->recurring_meetings, &rerr);
         }
         LoadSelectedDay(s, s->selected);
         ShowInfoBox(hwnd, L"已生成示例数据。建议打开“本季度(按分类)”查看汇总效果。", L"完成");
@@ -5187,16 +5176,10 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
       if (e.type == EntryType::Meeting) {
         AppendMenuW(menu, MF_STRING, IDM_CTX_CREATE_TASK_FROM_MEETING, L"从此会议创建长期任务...");
-
-        const RecurringMeeting* rm = FindRecurringTemplateByTitle(s, e.title);
-        if (rm && !rm->template_plain.empty()) {
-          if (e.body_plain.empty()) {
-            AppendMenuW(menu, MF_STRING, IDM_CTX_INSERT_MEETING_TEMPLATE, L"插入周期会议模板");
-          }
-        }
       }
       if (e.type == EntryType::TaskProgress && !e.task_id.empty()) {
         AppendMenuW(menu, MF_STRING, IDM_CTX_VIEW_TASK_PROGRESS, L"查看该任务每日进展汇总...");
+        AppendMenuW(menu, MF_STRING, IDM_CTX_OPEN_TASK_MATERIALS_DIR, L"打开任务材料目录");
       }
 
       if (GetMenuItemCount(menu) == 0) {
@@ -5300,7 +5283,45 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
   return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+static void TryEnablePerMonitorDpiAwareness() {
+  // Fix DPI virtualization issues (e.g. screenshot overlay "zooming" on high-DPI displays).
+  // Use dynamic lookup to keep compatibility with older Windows versions.
+  HMODULE user32 = GetModuleHandleW(L"user32.dll");
+  if (user32) {
+    using FnSetCtx = BOOL(WINAPI*)(HANDLE);
+    auto pSetCtx = reinterpret_cast<FnSetCtx>(GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+    if (pSetCtx) {
+      // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (HANDLE)-4
+      if (pSetCtx(reinterpret_cast<HANDLE>(-4))) return;
+      // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE == (HANDLE)-3
+      if (pSetCtx(reinterpret_cast<HANDLE>(-3))) return;
+    }
+  }
+
+  // Windows 8.1: SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE=2)
+  HMODULE shcore = LoadLibraryW(L"shcore.dll");
+  if (shcore) {
+    using FnSetAw = HRESULT(WINAPI*)(int);
+    auto pSetAw = reinterpret_cast<FnSetAw>(GetProcAddress(shcore, "SetProcessDpiAwareness"));
+    if (pSetAw) {
+      (void)pSetAw(2);
+      FreeLibrary(shcore);
+      return;
+    }
+    FreeLibrary(shcore);
+  }
+
+  // Vista+: system DPI aware.
+  if (user32) {
+    using FnSetAware = BOOL(WINAPI*)();
+    auto p = reinterpret_cast<FnSetAware>(GetProcAddress(user32, "SetProcessDPIAware"));
+    if (p) (void)p();
+  }
+}
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
+  TryEnablePerMonitorDpiAwareness();
+
   INITCOMMONCONTROLSEX icc{};
   icc.dwSize = sizeof(icc);
   icc.dwICC = ICC_DATE_CLASSES | ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES | ICC_BAR_CLASSES;
@@ -5364,10 +5385,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
           }
           if (msg.wParam == 'T') {
             SendMessageW(hwnd, WM_COMMAND, IDM_MANAGE_TASKS, 0);
-            continue;
-          }
-          if (msg.wParam == 'R') {
-            SendMessageW(hwnd, WM_COMMAND, IDM_MANAGE_RECURRING_MEETINGS, 0);
             continue;
           }
           if (focus == state.ed_body) {

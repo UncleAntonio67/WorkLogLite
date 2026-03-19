@@ -5,7 +5,7 @@
 enum class EntryType {
   Note = 0,
   TaskProgress = 1,
-  Meeting = 2,  // used for recurring/templated meetings
+  Meeting = 2,
 };
 
 enum class EntryStatus {

@@ -8,7 +8,7 @@ REM Fallback: bundled MinGW (w64devkit) if present at .toolchain\w64devkit\w64de
 set NOPAUSE=0
 if /I "%~1"=="--no-pause" set NOPAUSE=1
 
-set SOURCES=src\main.cpp src\storage.cpp src\report.cpp src\categories.cpp src\tasks.cpp src\recurring.cpp src\demo.cpp src\win32_util.cpp src\screenshot_tool.cpp
+set SOURCES=src\main.cpp src\storage.cpp src\report.cpp src\categories.cpp src\tasks.cpp src\demo.cpp src\win32_util.cpp src\screenshot_tool.cpp
 
 where cl >nul 2>nul
 if not errorlevel 1 goto :build_msvc
@@ -104,4 +104,3 @@ echo.
 echo Build failed.
 if "%NOPAUSE%"=="0" pause
 exit /b 1
-

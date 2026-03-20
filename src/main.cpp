@@ -57,6 +57,8 @@ enum : UINT {
   IDM_CTX_VIEW_TASK_PROGRESS = 20003,
   IDM_CTX_OPEN_TASK_MATERIALS_DIR = 20004,
   IDM_CTX_OPEN_MATERIALS_DIR = 20005,
+  IDM_CTX_SET_MATERIALS_DIR = 20006,
+  IDM_CTX_CLEAR_MATERIALS_DIR = 20007,
 
   // Formatting (RichEdit body)
   IDM_FMT_BOLD = 30001,
@@ -95,6 +97,7 @@ enum : int {
   IDC_BTN_SCREENSHOT_DIR = 2067,
   IDC_BTN_TASK_MATERIALS_ROOT = 2068,
   IDC_BTN_OPEN_MATERIALS = 2069,
+  IDC_BTN_SET_MATERIALS = 2070,
   IDC_STATUS = 2020,
   IDC_CB_STATUS = 2021,
   IDC_LBL_CATEGORY = 2030,
@@ -133,6 +136,7 @@ struct AppState {
   HWND btn_screenshot_dir{};
   HWND btn_task_materials{};
   HWND btn_open_materials{};
+  HWND btn_set_materials{};
   HWND lbl_category{};
   HWND lbl_start{};
   HWND lbl_end{};
@@ -181,6 +185,9 @@ struct AppState {
 
   std::vector<std::wstring> categories;
   std::vector<Task> tasks;
+
+  // Optional materials directory selected for the current editor content (used for new entries too).
+  std::wstring editor_materials_dir;
 };
 
 // Forward declarations used by small UI helpers defined early in this file.
@@ -282,14 +289,14 @@ static void ComputeMainMinClientSize(HWND hwnd, AppState* s, int* out_w, int* ou
   int h_no_status_need = y + pad + min_body_h;
 
   // Left office panel: number of buttons determines required rows.
-  int office_btn_count = 9;  // conservative fallback (current shipped count)
+  int office_btn_count = 10;  // conservative fallback (current shipped count)
   if (s) {
     office_btn_count = 0;
     for (HWND b : {s->btn_screenshot, s->btn_quick_reply, s->btn_timestamp, s->btn_focus_timer, s->btn_calc,
-                   s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials, s->btn_open_materials}) {
+                   s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials, s->btn_open_materials, s->btn_set_materials}) {
       if (b) office_btn_count++;
     }
-    if (office_btn_count <= 0) office_btn_count = 9;
+    if (office_btn_count <= 0) office_btn_count = 10;
   }
   int cols = 2;
   int rows = (office_btn_count + cols - 1) / cols;
@@ -597,6 +604,7 @@ static void UpdateStatusBar(AppState* s) {
     info += L"(新建)";
   }
   if (IsEditorTrulyDirty(s)) info += L"  未保存";
+  if (!s->editor_materials_dir.empty()) info += L"  材料路径已设置";
 
   if (s->focus_running) {
     ULONGLONG remain = (s->focus_end_tick > now) ? (s->focus_end_tick - now) : 0;
@@ -978,7 +986,7 @@ static bool EditorHasMeaningfulContent(AppState* s) {
   std::wstring body = GetWindowTextWString(s->ed_body);
 
   // If user hasn't typed anything besides category, don't nag on navigation.
-  bool has_any = !title.empty() || !body.empty() || !start_time.empty() || !end_time.empty();
+  bool has_any = !title.empty() || !body.empty() || !start_time.empty() || !end_time.empty() || !s->editor_materials_dir.empty();
   (void)category;
   return has_any;
 }
@@ -990,8 +998,9 @@ static bool EditorMatchesEntry(AppState* s, const Entry& e) {
   cur.end_time = GetWindowTextWString(s->ed_end);
   cur.title = GetWindowTextWString(s->ed_title);
   cur.body_plain = GetWindowTextWString(s->ed_body);
+  cur.materials_dir = s->editor_materials_dir;
   return cur.category == e.category && cur.start_time == e.start_time && cur.end_time == e.end_time &&
-         cur.title == e.title && cur.body_plain == e.body_plain;
+         cur.title == e.title && cur.body_plain == e.body_plain && cur.materials_dir == e.materials_dir;
 }
 
 static bool IsEditorTrulyDirty(AppState* s) {
@@ -1016,6 +1025,7 @@ static void ClearEditor(AppState* s) {
   if (s->cb_status) SendMessageW(s->cb_status, CB_SETCURSEL, 0, 0);
   SetEditText(s->ed_title, L"");
   SetEditText(s->ed_body, L"");
+  s->editor_materials_dir.clear();
   if (s->ed_title) SendMessageW(s->ed_title, EM_SETMODIFY, FALSE, 0);
   if (s->ed_body) SendMessageW(s->ed_body, EM_SETMODIFY, FALSE, 0);
   s->editing_index = -1;
@@ -1045,6 +1055,15 @@ static void FillEditorFromEntry(AppState* s, const Entry& e, int index) {
     }
   } else {
     SetEditText(s->ed_body, e.body_plain);
+  }
+
+  // Materials dir is always editable even if task progress is read-only in other fields.
+  // For task progress, it is treated as a property of the underlying Task.
+  if (is_task && !e.task_id.empty()) {
+    Task* t = FindTaskById(s, e.task_id);
+    s->editor_materials_dir = t ? t->materials_dir : L"";
+  } else {
+    s->editor_materials_dir = e.materials_dir;
   }
   if (s->ed_title) SendMessageW(s->ed_title, EM_SETMODIFY, FALSE, 0);
   if (s->ed_body) SendMessageW(s->ed_body, EM_SETMODIFY, FALSE, 0);
@@ -1189,6 +1208,13 @@ static bool SaveEditorToModel(AppState* s, bool* out_changed) {
     e.status = EntryStatus::None;
   }
 
+  // Materials dir: for task progress it is treated as a property of the Task, not the per-day entry.
+  if (EntryIsTaskProgress(e)) {
+    e.materials_dir.clear();
+  } else {
+    e.materials_dir = s->editor_materials_dir;
+  }
+
   // Trim category
   while (!e.category.empty() && iswspace(e.category.front())) e.category.erase(e.category.begin());
   while (!e.category.empty() && iswspace(e.category.back())) e.category.pop_back();
@@ -1214,7 +1240,7 @@ static bool SaveEditorToModel(AppState* s, bool* out_changed) {
   if (EntryIsTaskProgress(e)) {
     has_any = !e.body_plain.empty() || !e.start_time.empty() || !e.end_time.empty();
   } else {
-    has_any = !e.title.empty() || !e.body_plain.empty() || !e.start_time.empty() || !e.end_time.empty();
+    has_any = !e.title.empty() || !e.body_plain.empty() || !e.start_time.empty() || !e.end_time.empty() || !e.materials_dir.empty();
   }
   if (!has_any) {
     // Treat as "nothing to save": allow navigation without blocking.
@@ -3621,6 +3647,119 @@ static std::wstring GetTaskMaterialsDirById(const std::wstring& task_id) {
   return dir;
 }
 
+static bool StartsWithW(const std::wstring& s, const std::wstring& prefix) {
+  return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
+}
+
+static bool IsNetworkPathForbidden(const std::wstring& path) {
+  // Block UNC paths (e.g. \\server\share) to avoid implicit network access.
+  // Allow extended-length local paths like \\?\C:\...
+  if (StartsWithW(path, L"\\\\?\\UNC\\") || StartsWithW(path, L"//?/UNC/")) return true;
+  if (path.size() >= 2 && ((path[0] == L'\\' && path[1] == L'\\') || (path[0] == L'/' && path[1] == L'/'))) {
+    if (StartsWithW(path, L"\\\\?\\") || StartsWithW(path, L"\\\\.\\")) return false;
+    return true;
+  }
+  return false;
+}
+
+static std::wstring TaskMaterialsDirResolved(const Task& t) {
+  if (!t.materials_dir.empty()) return t.materials_dir;
+  return GetTaskMaterialsDirById(t.id);
+}
+
+static bool ConfirmMaterialsPathIfExternal(HWND owner, const std::wstring& picked_dir) {
+  std::wstring data_root = GetDataRootDir();
+  if (picked_dir.empty()) return true;
+  if (IsNetworkPathForbidden(picked_dir)) {
+    ShowInfoBox(owner, L"不允许设置为网络共享路径(UNC)。请改为本地磁盘目录。", L"提示");
+    return false;
+  }
+  if (!DirExistsW(picked_dir)) {
+    ShowInfoBox(owner, L"所选路径不存在或不是文件夹。", L"提示");
+    return false;
+  }
+  if (!IsSameOrChildDir(data_root, picked_dir)) {
+    int r = MessageBoxW(owner,
+                        L"该材料路径不在 WorkLogLite 数据目录内。\n\n"
+                        L"说明：导出/导入“全量数据”只会拷贝 data 目录，无法携带 data 目录之外的外部文件。\n\n"
+                        L"仍要继续使用该路径吗？",
+                        kAppTitle, MB_YESNO | MB_ICONQUESTION);
+    if (r != IDYES) return false;
+  }
+  return true;
+}
+
+static void SetMaterialsDirForSelected(AppState* s) {
+  if (!s) return;
+
+  int sel = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
+  if (sel < 0 || sel >= (int)s->day.entries.size()) {
+    // No selection: apply to current editor (useful for new entries before saving).
+    std::wstring picked;
+    if (!PickFolderDialog(s->hwnd, L"选择材料目录(本地)", &picked)) return;
+    if (!ConfirmMaterialsPathIfExternal(s->hwnd, picked)) return;
+    s->editor_materials_dir = picked;
+    SetEditorDirty(s, true);
+    UpdateStatusBar(s);
+    ShowToast(s, L"已设置当前编辑内容的材料路径(保存后生效)");
+    return;
+  }
+
+  Entry& e = s->day.entries[(size_t)sel];
+  if (EntryIsTaskProgress(e)) {
+    Task* t = FindTaskById(s, e.task_id);
+    if (!t) {
+      ShowInfoBox(s->hwnd, L"未找到对应的长期任务，无法设置材料路径。", L"提示");
+      return;
+    }
+    std::wstring picked;
+    if (!PickFolderDialog(s->hwnd, L"选择长期任务材料目录(本地)", &picked)) return;
+    if (!ConfirmMaterialsPathIfExternal(s->hwnd, picked)) return;
+    t->materials_dir = picked;
+    std::wstring terr;
+    SaveTasks(s->tasks, &terr);
+    ShowToast(s, L"已设置该长期任务的材料路径");
+    return;
+  }
+
+  std::wstring picked;
+  if (!PickFolderDialog(s->hwnd, L"选择材料目录(本地)", &picked)) return;
+  if (!ConfirmMaterialsPathIfExternal(s->hwnd, picked)) return;
+
+  e.materials_dir = picked;
+  if (s->editing_index == sel) s->editor_materials_dir = picked;
+  SetEditorDirty(s, true);
+  UpdateStatusBar(s);
+  ShowToast(s, L"已设置该条目的材料路径(保存后写入数据)");
+}
+
+static void ClearMaterialsDirForSelected(AppState* s) {
+  if (!s) return;
+  int sel = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
+  if (sel < 0 || sel >= (int)s->day.entries.size()) {
+    s->editor_materials_dir.clear();
+    SetEditorDirty(s, true);
+    UpdateStatusBar(s);
+    ShowToast(s, L"已清除当前编辑内容的材料路径");
+    return;
+  }
+  Entry& e = s->day.entries[(size_t)sel];
+  if (EntryIsTaskProgress(e)) {
+    Task* t = FindTaskById(s, e.task_id);
+    if (!t) return;
+    t->materials_dir.clear();
+    std::wstring terr;
+    SaveTasks(s->tasks, &terr);
+    ShowToast(s, L"已清除该长期任务的自定义材料路径");
+    return;
+  }
+  e.materials_dir.clear();
+  if (s->editing_index == sel) s->editor_materials_dir.clear();
+  SetEditorDirty(s, true);
+  UpdateStatusBar(s);
+  ShowToast(s, L"已清除该条目的自定义材料路径(保存后写入数据)");
+}
+
 static void OpenTaskMaterialsDir(HWND owner, const std::wstring& task_id) {
   if (task_id.empty()) {
     ShowInfoBox(owner, L"任务ID为空，无法打开材料目录。", L"提示");
@@ -3664,7 +3803,33 @@ static void OpenWorkMaterialsDir(HWND owner, const SYSTEMTIME& date, const std::
 static void OpenMaterialsDirForEntry(HWND owner, AppState* s, const Entry& e) {
   if (!s) return;
   if (EntryIsTaskProgress(e) && !e.task_id.empty()) {
+    Task* t = FindTaskById(s, e.task_id);
+    if (t) {
+      std::wstring dir = TaskMaterialsDirResolved(*t);
+      if (IsNetworkPathForbidden(dir)) {
+        ShowInfoBox(owner, L"材料路径为网络共享(UNC)，出于安全考虑已禁止打开。请改为本地目录。", L"提示");
+        return;
+      }
+      if (!DirExistsW(dir)) {
+        ShowInfoBox(owner, L"材料路径不存在或不是文件夹。请重新设置材料路径。", L"提示");
+        return;
+      }
+      ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+      return;
+    }
     OpenTaskMaterialsDir(owner, e.task_id);
+    return;
+  }
+  if (!e.materials_dir.empty()) {
+    if (IsNetworkPathForbidden(e.materials_dir)) {
+      ShowInfoBox(owner, L"材料路径为网络共享(UNC)，出于安全考虑已禁止打开。请改为本地目录。", L"提示");
+      return;
+    }
+    if (!DirExistsW(e.materials_dir)) {
+      ShowInfoBox(owner, L"材料路径不存在或不是文件夹。请重新设置材料路径。", L"提示");
+      return;
+    }
+    ShellExecuteW(nullptr, L"open", e.materials_dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     return;
   }
   OpenWorkMaterialsDir(owner, s->selected, e.id);
@@ -3676,6 +3841,7 @@ static void EnsureMaterialsDirForEntry(AppState* s, const Entry& e) {
     (void)GetTaskMaterialsDirById(e.task_id);
     return;
   }
+  if (!e.materials_dir.empty()) return;
   if (!e.id.empty()) {
     (void)GetWorkMaterialsDir(s->selected, e.id);
   }
@@ -4414,7 +4580,17 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         if (!cmd) return 0;
 
         if (cmd == 1001 && has_sel) {
-          OpenTaskMaterialsDir(hwnd, s->working[(size_t)idx].id);
+          const Task& t = s->working[(size_t)idx];
+          std::wstring dir = TaskMaterialsDirResolved(t);
+          if (IsNetworkPathForbidden(dir)) {
+            ShowInfoBox(hwnd, L"材料路径为网络共享(UNC)，出于安全考虑已禁止打开。请改为本地目录。", L"提示");
+            return 0;
+          }
+          if (!DirExistsW(dir)) {
+            ShowInfoBox(hwnd, L"材料路径不存在或不是文件夹。请重新设置材料路径。", L"提示");
+            return 0;
+          }
+          ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         } else if (cmd == 1002) {
           std::wstring root = GetTaskMaterialsRootDir();
           ShellExecuteW(nullptr, L"open", root.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -4503,7 +4679,17 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
           ShowInfoBox(hwnd, L"请先在左侧列表选择一个任务。", L"提示");
           return 0;
         }
-        OpenTaskMaterialsDir(hwnd, s->working[(size_t)idx].id);
+        const Task& t = s->working[(size_t)idx];
+        std::wstring dir = TaskMaterialsDirResolved(t);
+        if (IsNetworkPathForbidden(dir)) {
+          ShowInfoBox(hwnd, L"材料路径为网络共享(UNC)，出于安全考虑已禁止打开。请改为本地目录。", L"提示");
+          return 0;
+        }
+        if (!DirExistsW(dir)) {
+          ShowInfoBox(hwnd, L"材料路径不存在或不是文件夹。请重新设置材料路径。", L"提示");
+          return 0;
+        }
+        ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         return 0;
       }
       if (id == 9) {  // delete
@@ -4627,7 +4813,8 @@ static void Layout(AppState* s) {
   int bh = ScalePx(s->hwnd, 32);
   int bw = (left_w - 2 * inner - gap) / cols;
   std::vector<HWND> btns = {s->btn_screenshot, s->btn_quick_reply, s->btn_timestamp, s->btn_focus_timer,
-                            s->btn_calc, s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials, s->btn_open_materials};
+                            s->btn_calc, s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials, s->btn_open_materials,
+                            s->btn_set_materials};
   for (size_t i = 0; i < btns.size(); i++) {
     HWND b = btns[i];
     if (!b) continue;
@@ -4960,6 +5147,9 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       s->btn_open_materials = CreateWindowExW(0, L"BUTTON", L"材料目录",
                                               office_btn_style,
                                               0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_OPEN_MATERIALS, nullptr, nullptr);
+      s->btn_set_materials = CreateWindowExW(0, L"BUTTON", L"设置路径",
+                                              office_btn_style,
+                                              0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_SET_MATERIALS, nullptr, nullptr);
 
       // Fonts
       for (HWND h : {s->cal, s->st_day, s->list, s->lbl_category, s->lbl_start, s->lbl_end, s->lbl_title, s->lbl_body,
@@ -4969,7 +5159,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                      s->ed_body, s->status,
                       s->btn_new, s->btn_save, s->btn_preview, s->btn_del,
                      s->grp_office, s->btn_screenshot, s->btn_quick_reply, s->btn_timestamp, s->btn_focus_timer, s->btn_calc,
-                     s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials, s->btn_open_materials}) {
+                     s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials, s->btn_open_materials, s->btn_set_materials}) {
         SetControlFont(h, s->font);
       }
 
@@ -5056,7 +5246,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       int id = (int)wParam;
       if (id == IDC_BTN_SCREENSHOT || id == IDC_BTN_QUICK_REPLY || id == IDC_BTN_TIMESTAMP || id == IDC_BTN_FOCUS_TIMER ||
           id == IDC_BTN_CALC || id == IDC_BTN_DATA_DIR || id == IDC_BTN_SCREENSHOT_DIR || id == IDC_BTN_TASK_MATERIALS_ROOT ||
-          id == IDC_BTN_OPEN_MATERIALS) {
+          id == IDC_BTN_OPEN_MATERIALS || id == IDC_BTN_SET_MATERIALS) {
         DrawOfficeButton(reinterpret_cast<const DRAWITEMSTRUCT*>(lParam));
         return TRUE;
       }
@@ -5135,11 +5325,27 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       if (id == IDC_BTN_OPEN_MATERIALS && code == BN_CLICKED) {
         int sel = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
         if (sel < 0 || sel >= (int)s->day.entries.size()) {
+          if (!s->editor_materials_dir.empty()) {
+            if (IsNetworkPathForbidden(s->editor_materials_dir)) {
+              ShowInfoBox(s->hwnd, L"材料路径为网络共享(UNC)，出于安全考虑已禁止打开。请改为本地目录。", L"提示");
+              return 0;
+            }
+            if (!DirExistsW(s->editor_materials_dir)) {
+              ShowInfoBox(s->hwnd, L"材料路径不存在或不是文件夹。请重新设置材料路径。", L"提示");
+              return 0;
+            }
+            ShellExecuteW(nullptr, L"open", s->editor_materials_dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            return 0;
+          }
           ShowInfoBox(s->hwnd, L"请先在右侧列表选择一条工作/会议/任务进展，再打开材料目录。", L"提示");
           return 0;
         }
         const Entry& e = s->day.entries[(size_t)sel];
         OpenMaterialsDirForEntry(s->hwnd, s, e);
+        return 0;
+      }
+      if (id == IDC_BTN_SET_MATERIALS && code == BN_CLICKED) {
+        SetMaterialsDirForSelected(s);
         return 0;
       }
 
@@ -5314,7 +5520,21 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         if (sel < 0 || sel >= (int)s->day.entries.size()) return 0;
         const Entry& e = s->day.entries[(size_t)sel];
         if (e.type != EntryType::TaskProgress || e.task_id.empty()) return 0;
-        OpenTaskMaterialsDir(s->hwnd, e.task_id);
+        Task* t = FindTaskById(s, e.task_id);
+        if (t) {
+          std::wstring dir = TaskMaterialsDirResolved(*t);
+          if (IsNetworkPathForbidden(dir)) {
+            ShowInfoBox(s->hwnd, L"材料路径为网络共享(UNC)，出于安全考虑已禁止打开。请改为本地目录。", L"提示");
+            return 0;
+          }
+          if (!DirExistsW(dir)) {
+            ShowInfoBox(s->hwnd, L"材料路径不存在或不是文件夹。请重新设置材料路径。", L"提示");
+            return 0;
+          }
+          ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        } else {
+          OpenTaskMaterialsDir(s->hwnd, e.task_id);
+        }
         return 0;
       }
       if (id == IDM_CTX_OPEN_MATERIALS_DIR) {
@@ -5322,6 +5542,14 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         if (sel < 0 || sel >= (int)s->day.entries.size()) return 0;
         const Entry& e = s->day.entries[(size_t)sel];
         OpenMaterialsDirForEntry(s->hwnd, s, e);
+        return 0;
+      }
+      if (id == IDM_CTX_SET_MATERIALS_DIR) {
+        SetMaterialsDirForSelected(s);
+        return 0;
+      }
+      if (id == IDM_CTX_CLEAR_MATERIALS_DIR) {
+        ClearMaterialsDirForSelected(s);
         return 0;
       }
       if (id == IDM_CTX_CREATE_TASK_FROM_MEETING) {
@@ -5465,6 +5693,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       }
 
       AppendMenuW(menu, MF_STRING, IDM_CTX_OPEN_MATERIALS_DIR, L"打开材料目录");
+      AppendMenuW(menu, MF_STRING, IDM_CTX_SET_MATERIALS_DIR, L"设置存放路径...");
+      AppendMenuW(menu, MF_STRING, IDM_CTX_CLEAR_MATERIALS_DIR, L"清除存放路径(默认)");
 
       if (GetMenuItemCount(menu) == 0) {
         DestroyMenu(menu);

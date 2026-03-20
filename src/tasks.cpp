@@ -172,6 +172,9 @@ bool LoadTasks(std::vector<Task>* out, std::wstring* err) {
     } else if (k == L"title_b64") {
       std::string bytes;
       if (Base64Decode(WideToUtf8(v), &bytes)) cur.title = Utf8ToWide(bytes);
+    } else if (k == L"materials_dir_b64") {
+      std::string bytes;
+      if (Base64Decode(WideToUtf8(v), &bytes)) cur.materials_dir = Utf8ToWide(bytes);
     }
   }
   flush();
@@ -191,6 +194,7 @@ bool SaveTasks(const std::vector<Task>& tasks, std::wstring* err) {
     out += "id=" + WideToUtf8(t.id) + "\n";
     out += "category_b64=" + Base64Encode(WideToUtf8(t.category)) + "\n";
     out += "title_b64=" + Base64Encode(WideToUtf8(t.title)) + "\n";
+    out += "materials_dir_b64=" + Base64Encode(WideToUtf8(t.materials_dir)) + "\n";
     out += "basis_b64=" + Base64Encode(WideToUtf8(t.basis)) + "\n";
     out += "desc_plain_b64=" + Base64Encode(WideToUtf8(t.desc_plain)) + "\n";
     out += "desc_rtf_b64=" + t.desc_rtf_b64 + "\n";

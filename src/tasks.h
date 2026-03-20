@@ -12,6 +12,10 @@ struct Task {
   std::wstring category;
   std::wstring title;
 
+  // Optional: user-selected materials folder for this task (local path).
+  // If empty, the app can fall back to the default auto materials folder.
+  std::wstring materials_dir;
+
   // Optional metadata for "task has basis and description".
   std::wstring basis;        // e.g. meeting/date/doc reference
   std::wstring desc_plain;   // fallback text

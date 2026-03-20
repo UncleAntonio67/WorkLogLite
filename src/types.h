@@ -23,6 +23,10 @@ struct Entry {
   EntryType type{EntryType::Note};
   std::wstring task_id;  // only for TaskProgress
 
+  // Optional: user-selected materials folder for this entry (local path).
+  // If empty, the app can fall back to the default auto materials folder.
+  std::wstring materials_dir;
+
   std::wstring category;    // user-defined
   std::wstring start_time;  // "HH:MM" or empty
   std::wstring end_time;    // "HH:MM" or empty

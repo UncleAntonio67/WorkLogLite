@@ -147,19 +147,19 @@ static bool EnsureParentDir(const std::wstring& path, std::wstring* err) {
 
 static bool ShouldPersistEntry(const Entry& e) {
   if (e.placeholder) return false;
-  bool has_any = !e.title.empty() || !e.body_plain.empty() || !e.body_rtf_b64.empty() ||
+  bool has_any = !e.title.empty() || !e.body_plain.empty() || !e.body_rtf_b64.empty() || !e.materials_dir.empty() ||
                  !e.start_time.empty() || !e.end_time.empty() || e.status != EntryStatus::None;
   if (!has_any) return false;
 
   // For task placeholders, avoid writing empty records unless there's real progress/status/time.
   if (e.type == EntryType::TaskProgress) {
-    bool has_task_any = !e.body_plain.empty() || !e.body_rtf_b64.empty() ||
+    bool has_task_any = !e.body_plain.empty() || !e.body_rtf_b64.empty() || !e.materials_dir.empty() ||
                         !e.start_time.empty() || !e.end_time.empty() || e.status != EntryStatus::None;
     return has_task_any;
   }
   // For meeting templates, avoid persisting if only title exists.
   if (e.type == EntryType::Meeting) {
-    bool has_meeting_any = !e.body_plain.empty() || !e.body_rtf_b64.empty() ||
+    bool has_meeting_any = !e.body_plain.empty() || !e.body_rtf_b64.empty() || !e.materials_dir.empty() ||
                            !e.start_time.empty() || !e.end_time.empty();
     return has_meeting_any;
   }
@@ -258,6 +258,10 @@ static bool LoadDayFileWlr(const std::wstring& path, const SYSTEMTIME& date, Day
       std::string bytes;
       if (!Base64Decode(WideToUtf8(v), &bytes)) continue;
       cur.title = Utf8ToWide(bytes);
+    } else if (k == L"materials_dir_b64") {
+      std::string bytes;
+      if (!Base64Decode(WideToUtf8(v), &bytes)) continue;
+      cur.materials_dir = Utf8ToWide(bytes);
     } else if (k == L"body_plain_b64") {
       std::string bytes;
       if (!Base64Decode(WideToUtf8(v), &bytes)) continue;
@@ -390,6 +394,7 @@ bool SaveDayFile(const DayData& day, std::wstring* err) {
     WriteB64Field(out, "task_id_b64", e.task_id);
     WriteB64Field(out, "category_b64", e.category);
     WriteB64Field(out, "title_b64", e.title);
+    WriteB64Field(out, "materials_dir_b64", e.materials_dir);
     WriteB64Field(out, "body_plain_b64", e.body_plain);
 
     // body_rtf_b64 is already base64, store as-is.

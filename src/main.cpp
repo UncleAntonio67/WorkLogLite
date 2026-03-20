@@ -56,6 +56,7 @@ enum : UINT {
   IDM_CTX_CREATE_TASK_FROM_MEETING = 20001,
   IDM_CTX_VIEW_TASK_PROGRESS = 20003,
   IDM_CTX_OPEN_TASK_MATERIALS_DIR = 20004,
+  IDM_CTX_OPEN_MATERIALS_DIR = 20005,
 
   // Formatting (RichEdit body)
   IDM_FMT_BOLD = 30001,
@@ -93,6 +94,7 @@ enum : int {
   IDC_BTN_DATA_DIR = 2066,
   IDC_BTN_SCREENSHOT_DIR = 2067,
   IDC_BTN_TASK_MATERIALS_ROOT = 2068,
+  IDC_BTN_OPEN_MATERIALS = 2069,
   IDC_STATUS = 2020,
   IDC_CB_STATUS = 2021,
   IDC_LBL_CATEGORY = 2030,
@@ -130,6 +132,7 @@ struct AppState {
   HWND btn_data_dir{};
   HWND btn_screenshot_dir{};
   HWND btn_task_materials{};
+  HWND btn_open_materials{};
   HWND lbl_category{};
   HWND lbl_start{};
   HWND lbl_end{};
@@ -189,6 +192,151 @@ static void OpenDataDir(AppState* s);
 
 static bool IsEditorTrulyDirty(AppState* s);
 static void SetEditorDirty(AppState* s, bool dirty);
+
+static void OpenMaterialsDirForEntry(HWND owner, AppState* s, const Entry& e);
+static void EnsureMaterialsDirForEntry(AppState* s, const Entry& e);
+
+static UINT QueryDpiForWindowCompat(HWND hwnd) {
+  HMODULE user32 = GetModuleHandleW(L"user32.dll");
+  if (!user32) return 96;
+  using Fn = UINT(WINAPI*)(HWND);
+  auto p = reinterpret_cast<Fn>(GetProcAddress(user32, "GetDpiForWindow"));
+  if (!p) return 96;
+  return p(hwnd);
+}
+
+static UINT QuerySystemDpiCompat() {
+  // Prefer Win10's GetDpiForSystem; fallback to primary monitor LOGPIXELSX.
+  HMODULE user32 = GetModuleHandleW(L"user32.dll");
+  if (user32) {
+    using Fn = UINT(WINAPI*)();
+    auto p = reinterpret_cast<Fn>(GetProcAddress(user32, "GetDpiForSystem"));
+    if (p) return p();
+  }
+  HDC hdc = GetDC(nullptr);
+  int dpi = hdc ? GetDeviceCaps(hdc, LOGPIXELSX) : 96;
+  if (hdc) ReleaseDC(nullptr, hdc);
+  if (dpi <= 0) dpi = 96;
+  return (UINT)dpi;
+}
+
+static void AdjustWindowRectExForDpiCompat(RECT* rc, DWORD style, BOOL has_menu, DWORD ex_style, UINT dpi) {
+  if (!rc) return;
+  HMODULE user32 = GetModuleHandleW(L"user32.dll");
+  if (user32) {
+    using Fn = BOOL(WINAPI*)(LPRECT, DWORD, BOOL, DWORD, UINT);
+    auto p = reinterpret_cast<Fn>(GetProcAddress(user32, "AdjustWindowRectExForDpi"));
+    if (p) {
+      (void)p(rc, style, has_menu, ex_style, dpi);
+      return;
+    }
+  }
+  (void)AdjustWindowRectEx(rc, style, has_menu, ex_style);
+}
+
+static void ComputeMainMinClientSize(HWND hwnd, AppState* s, int* out_w, int* out_h) {
+  if (out_w) *out_w = 900;
+  if (out_h) *out_h = 640;
+  if (!hwnd) return;
+
+  int pad = ScalePx(hwnd, 10);
+  int left_w = ScalePx(hwnd, 260);
+  int top_h = ScalePx(hwnd, 240);
+  int row_h = ScalePx(hwnd, 26);
+  int lbl_h = ScalePx(hwnd, 18);
+  int btn_w = ScalePx(hwnd, 72);
+
+  // Right-side row fields widths (category/start/end/status) + a gap before right-aligned buttons.
+  int w_fields = ScalePx(hwnd, 140) + pad + ScalePx(hwnd, 70) + pad + ScalePx(hwnd, 70) + pad + ScalePx(hwnd, 90);
+  int w_buttons = 4 * btn_w + 3 * pad;
+  int right_min_w = w_fields + pad + w_buttons;
+
+  // Formatting toolbar width (11 buttons).
+  int tbw = ScalePx(hwnd, 30);
+  int tb_pad = ScalePx(hwnd, 6);
+  int w_toolbar = 11 * tbw + 10 * tb_pad;
+  if (right_min_w < w_toolbar) right_min_w = w_toolbar;
+
+  int min_client_w = pad + left_w + pad + right_min_w + pad;
+
+  // Height: ensure office buttons fit and body editor has a minimum height.
+  int status_h = ScalePx(hwnd, 22);
+  if (s && s->status) {
+    RECT rs{};
+    if (GetWindowRect(s->status, &rs)) status_h = (rs.bottom - rs.top);
+  }
+
+  // Compute y (layout's "y" right before ed_body) to keep logic consistent with Layout().
+  int y = pad;
+  y += lbl_h + ScalePx(hwnd, 4);
+  y += top_h + pad;
+  y += lbl_h + ScalePx(hwnd, 2);
+  y += row_h + pad;
+  y += lbl_h + ScalePx(hwnd, 2);
+  y += row_h + pad;
+  y += lbl_h + ScalePx(hwnd, 2);
+  int tbh = ScalePx(hwnd, 26);
+  y += tbh + ScalePx(hwnd, 4);
+
+  int min_body_h = ScalePx(hwnd, 160);
+  int h_no_status_need = y + pad + min_body_h;
+
+  // Left office panel: number of buttons determines required rows.
+  int office_btn_count = 9;  // conservative fallback (current shipped count)
+  if (s) {
+    office_btn_count = 0;
+    for (HWND b : {s->btn_screenshot, s->btn_quick_reply, s->btn_timestamp, s->btn_focus_timer, s->btn_calc,
+                   s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials, s->btn_open_materials}) {
+      if (b) office_btn_count++;
+    }
+    if (office_btn_count <= 0) office_btn_count = 9;
+  }
+  int cols = 2;
+  int rows = (office_btn_count + cols - 1) / cols;
+  if (rows < 1) rows = 1;
+  int bh = ScalePx(hwnd, 32);
+  int gap = ScalePx(hwnd, 8);
+  int office_header = ScalePx(hwnd, 26);
+  int office_need = office_header + rows * bh + (rows - 1) * gap + ScalePx(hwnd, 8);
+  int office_y = pad + top_h + pad;
+  int h_no_status_need2 = office_y + office_need + pad;
+  if (h_no_status_need < h_no_status_need2) h_no_status_need = h_no_status_need2;
+
+  int min_client_h = h_no_status_need + status_h;
+
+  if (out_w) *out_w = min_client_w;
+  if (out_h) *out_h = min_client_h;
+}
+
+static void ApplyMinTrackSize(HWND hwnd, AppState* s, MINMAXINFO* mmi) {
+  if (!hwnd || !mmi) return;
+
+  int min_client_w = 0, min_client_h = 0;
+  ComputeMainMinClientSize(hwnd, s, &min_client_w, &min_client_h);
+
+  RECT rc{0, 0, min_client_w, min_client_h};
+  DWORD style = (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE);
+  DWORD ex_style = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+  BOOL has_menu = GetMenu(hwnd) != nullptr;
+  UINT dpi = QueryDpiForWindowCompat(hwnd);
+  AdjustWindowRectExForDpiCompat(&rc, style, has_menu, ex_style, dpi);
+
+  int min_w = rc.right - rc.left;
+  int min_h = rc.bottom - rc.top;
+  if (min_w < 400) min_w = 400;
+  if (min_h < 300) min_h = 300;
+
+  // Avoid an impossible minimum size on small screens: cap to current work area.
+  RECT wa{};
+  if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0)) {
+    int ww = wa.right - wa.left;
+    int wh = wa.bottom - wa.top;
+    if (ww > 0 && min_w > ww) min_w = ww;
+    if (wh > 0 && min_h > wh) min_h = wh;
+  }
+  mmi->ptMinTrackSize.x = min_w;
+  mmi->ptMinTrackSize.y = min_h;
+}
 
 static AppState* GetState(HWND hwnd) {
   return reinterpret_cast<AppState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -1098,6 +1246,7 @@ static bool SaveEditorToModel(AppState* s, bool* out_changed) {
 
   // Once user saves, this entry should persist.
   s->day.entries[(size_t)s->editing_index].placeholder = false;
+  EnsureMaterialsDirForEntry(s, s->day.entries[(size_t)s->editing_index]);
 
   // Add category to list if new, and persist categories best-effort.
   if (!CategoriesContains(s->categories, e.category)) {
@@ -3481,6 +3630,57 @@ static void OpenTaskMaterialsDir(HWND owner, const std::wstring& task_id) {
   ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
+static std::wstring DateKeyYmd(const SYSTEMTIME& st) {
+  wchar_t buf[32]{};
+  wsprintfW(buf, L"%04d-%02d-%02d", (int)st.wYear, (int)st.wMonth, (int)st.wDay);
+  return buf;
+}
+
+static std::wstring GetWorkMaterialsRootDir() {
+  std::wstring root = JoinPath(GetDataRootDir(), L"work_materials");
+  EnsureDirExists(root);
+  return root;
+}
+
+static std::wstring GetWorkMaterialsDir(const SYSTEMTIME& date, const std::wstring& entry_id) {
+  std::wstring root = GetWorkMaterialsRootDir();
+  std::wstring day = JoinPathLoose(root, DateKeyYmd(date));
+  EnsureDirExists(day);
+  std::wstring safe_id = SanitizeDirNameComponent(entry_id.empty() ? L"no_id" : entry_id);
+  std::wstring dir = JoinPathLoose(day, safe_id);
+  EnsureDirExists(dir);
+  return dir;
+}
+
+static void OpenWorkMaterialsDir(HWND owner, const SYSTEMTIME& date, const std::wstring& entry_id) {
+  if (entry_id.empty()) {
+    ShowInfoBox(owner, L"该条目尚未保存(没有ID)。请先点击“保存”，再打开材料目录。", L"提示");
+    return;
+  }
+  std::wstring dir = GetWorkMaterialsDir(date, entry_id);
+  ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+static void OpenMaterialsDirForEntry(HWND owner, AppState* s, const Entry& e) {
+  if (!s) return;
+  if (EntryIsTaskProgress(e) && !e.task_id.empty()) {
+    OpenTaskMaterialsDir(owner, e.task_id);
+    return;
+  }
+  OpenWorkMaterialsDir(owner, s->selected, e.id);
+}
+
+static void EnsureMaterialsDirForEntry(AppState* s, const Entry& e) {
+  if (!s) return;
+  if (EntryIsTaskProgress(e) && !e.task_id.empty()) {
+    (void)GetTaskMaterialsDirById(e.task_id);
+    return;
+  }
+  if (!e.id.empty()) {
+    (void)GetWorkMaterialsDir(s->selected, e.id);
+  }
+}
+
 static Task BuildTaskFromMeeting(const SYSTEMTIME& meeting_date, const Entry& meeting) {
   Task t{};
   t.id = NewTaskId();
@@ -4427,7 +4627,7 @@ static void Layout(AppState* s) {
   int bh = ScalePx(s->hwnd, 32);
   int bw = (left_w - 2 * inner - gap) / cols;
   std::vector<HWND> btns = {s->btn_screenshot, s->btn_quick_reply, s->btn_timestamp, s->btn_focus_timer,
-                            s->btn_calc, s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials};
+                            s->btn_calc, s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials, s->btn_open_materials};
   for (size_t i = 0; i < btns.size(); i++) {
     HWND b = btns[i];
     if (!b) continue;
@@ -4757,6 +4957,9 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       s->btn_task_materials = CreateWindowExW(0, L"BUTTON", L"任务材料",
                                               office_btn_style,
                                               0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_TASK_MATERIALS_ROOT, nullptr, nullptr);
+      s->btn_open_materials = CreateWindowExW(0, L"BUTTON", L"材料目录",
+                                              office_btn_style,
+                                              0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_OPEN_MATERIALS, nullptr, nullptr);
 
       // Fonts
       for (HWND h : {s->cal, s->st_day, s->list, s->lbl_category, s->lbl_start, s->lbl_end, s->lbl_title, s->lbl_body,
@@ -4766,7 +4969,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                      s->ed_body, s->status,
                       s->btn_new, s->btn_save, s->btn_preview, s->btn_del,
                      s->grp_office, s->btn_screenshot, s->btn_quick_reply, s->btn_timestamp, s->btn_focus_timer, s->btn_calc,
-                     s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials}) {
+                     s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials, s->btn_open_materials}) {
         SetControlFont(h, s->font);
       }
 
@@ -4795,6 +4998,10 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         std::wstring terr;
         LoadTasks(&s->tasks, &terr);
       }
+      // Ensure every long-term task has a stable materials directory, including after import/upgrade.
+      for (const auto& t : s->tasks) {
+        if (!t.id.empty()) (void)GetTaskMaterialsDirById(t.id);
+      }
 
 
       // Field hints
@@ -4811,6 +5018,11 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       Layout(s);
       UpdateStatusParts(s);
       UpdateStatusBar(s);
+      return 0;
+    }
+
+    case WM_GETMINMAXINFO: {
+      ApplyMinTrackSize(hwnd, s, reinterpret_cast<MINMAXINFO*>(lParam));
       return 0;
     }
 
@@ -4843,7 +5055,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     case WM_DRAWITEM: {
       int id = (int)wParam;
       if (id == IDC_BTN_SCREENSHOT || id == IDC_BTN_QUICK_REPLY || id == IDC_BTN_TIMESTAMP || id == IDC_BTN_FOCUS_TIMER ||
-          id == IDC_BTN_CALC || id == IDC_BTN_DATA_DIR || id == IDC_BTN_SCREENSHOT_DIR || id == IDC_BTN_TASK_MATERIALS_ROOT) {
+          id == IDC_BTN_CALC || id == IDC_BTN_DATA_DIR || id == IDC_BTN_SCREENSHOT_DIR || id == IDC_BTN_TASK_MATERIALS_ROOT ||
+          id == IDC_BTN_OPEN_MATERIALS) {
         DrawOfficeButton(reinterpret_cast<const DRAWITEMSTRUCT*>(lParam));
         return TRUE;
       }
@@ -4917,6 +5130,16 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       if (id == IDC_BTN_TASK_MATERIALS_ROOT && code == BN_CLICKED) {
         std::wstring dir = GetTaskMaterialsRootDir();
         ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        return 0;
+      }
+      if (id == IDC_BTN_OPEN_MATERIALS && code == BN_CLICKED) {
+        int sel = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
+        if (sel < 0 || sel >= (int)s->day.entries.size()) {
+          ShowInfoBox(s->hwnd, L"请先在右侧列表选择一条工作/会议/任务进展，再打开材料目录。", L"提示");
+          return 0;
+        }
+        const Entry& e = s->day.entries[(size_t)sel];
+        OpenMaterialsDirForEntry(s->hwnd, s, e);
         return 0;
       }
 
@@ -5094,6 +5317,13 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         OpenTaskMaterialsDir(s->hwnd, e.task_id);
         return 0;
       }
+      if (id == IDM_CTX_OPEN_MATERIALS_DIR) {
+        int sel = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
+        if (sel < 0 || sel >= (int)s->day.entries.size()) return 0;
+        const Entry& e = s->day.entries[(size_t)sel];
+        OpenMaterialsDirForEntry(s->hwnd, s, e);
+        return 0;
+      }
       if (id == IDM_CTX_CREATE_TASK_FROM_MEETING) {
         if (!PromptSaveIfDirty(s)) return 0;
         int sel = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
@@ -5233,6 +5463,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         AppendMenuW(menu, MF_STRING, IDM_CTX_VIEW_TASK_PROGRESS, L"查看该任务每日进展汇总...");
         AppendMenuW(menu, MF_STRING, IDM_CTX_OPEN_TASK_MATERIALS_DIR, L"打开任务材料目录");
       }
+
+      AppendMenuW(menu, MF_STRING, IDM_CTX_OPEN_MATERIALS_DIR, L"打开材料目录");
 
       if (GetMenuItemCount(menu) == 0) {
         DestroyMenu(menu);
@@ -5393,11 +5625,57 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
   if (!RegisterClassW(&wc)) return 0;
 
+  // Size the initial window based on system DPI so that scaled controls are visible without requiring a manual resize.
+  UINT sys_dpi = QuerySystemDpiCompat();
+  int init_w = MulDiv(1100, (int)sys_dpi, 96);
+  int init_h = MulDiv(760, (int)sys_dpi, 96);
+  RECT wa{};
+  if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0)) {
+    int ww = wa.right - wa.left;
+    int wh = wa.bottom - wa.top;
+    if (init_w > ww) init_w = ww;
+    if (init_h > wh) init_h = wh;
+    if (init_w < 800) init_w = 800;
+    if (init_h < 560) init_h = 560;
+  }
+
   HWND hwnd = CreateWindowExW(0, wc.lpszClassName, kAppTitle,
                               WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 1100, 720,
+                              CW_USEDEFAULT, CW_USEDEFAULT, init_w, init_h,
                               nullptr, nullptr, hInstance, &state);
   if (!hwnd) return 0;
+
+  // Ensure initial size meets our computed minimum (DPI aware). Clamp to work area to avoid going off-screen.
+  {
+    int min_cw = 0, min_ch = 0;
+    ComputeMainMinClientSize(hwnd, &state, &min_cw, &min_ch);
+
+    RECT cc{};
+    GetClientRect(hwnd, &cc);
+    int cur_cw = cc.right - cc.left;
+    int cur_ch = cc.bottom - cc.top;
+
+    if (cur_cw < min_cw || cur_ch < min_ch) {
+      RECT wr{0, 0, (cur_cw < min_cw ? min_cw : cur_cw), (cur_ch < min_ch ? min_ch : cur_ch)};
+      DWORD style = (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE);
+      DWORD ex_style = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+      BOOL has_menu = GetMenu(hwnd) != nullptr;
+      UINT dpi = QueryDpiForWindowCompat(hwnd);
+      AdjustWindowRectExForDpiCompat(&wr, style, has_menu, ex_style, dpi);
+      int want_w = wr.right - wr.left;
+      int want_h = wr.bottom - wr.top;
+
+      RECT wa2{};
+      if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa2, 0)) {
+        int ww = wa2.right - wa2.left;
+        int wh = wa2.bottom - wa2.top;
+        if (want_w > ww) want_w = ww;
+        if (want_h > wh) want_h = wh;
+      }
+
+      SetWindowPos(hwnd, nullptr, 0, 0, want_w, want_h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+  }
 
   ShowWindow(hwnd, nCmdShow);
   UpdateWindow(hwnd);

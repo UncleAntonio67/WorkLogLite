@@ -3458,6 +3458,9 @@ struct TaskWindowState {
   HWND ed_title{};
   HWND lbl_basis{};
   HWND ed_basis{};
+  HWND lbl_materials{};
+  HWND ed_materials{};
+  HWND btn_pick_dir{};
   HWND lbl_desc{};
   HWND re_desc{};
   HWND lbl_start{};
@@ -3476,7 +3479,16 @@ struct TaskWindowState {
   AppState* app{};
   std::vector<Task> working;
   int initial_select{-1};
+
+  // When creating a new task (no list selection), we generate an id early so the user can
+  // set/open a materials folder before the first save.
+  std::wstring draft_task_id;
 };
+
+// Helpers used by the long-term task window (defined later in this file).
+static std::wstring NewTaskId();
+static std::wstring GetTaskMaterialsDirById(const std::wstring& task_id);
+static std::wstring TaskMaterialsDirResolved(const Task& t);
 
 static std::wstring FormatTaskListItem(const Task& t) {
   std::wstring s = L"[";
@@ -3506,10 +3518,16 @@ static int TaskGetSelectedIndex(TaskWindowState* s) {
 static void TaskFillFieldsFromSelection(TaskWindowState* s) {
   int idx = TaskGetSelectedIndex(s);
   if (idx < 0 || idx >= (int)s->working.size()) return;
+  s->draft_task_id.clear();
   const Task& t = s->working[(size_t)idx];
   SetWindowTextW(s->cb_category, t.category.c_str());
   SetWindowTextW(s->ed_title, t.title.c_str());
   SetWindowTextW(s->ed_basis, t.basis.c_str());
+  // Display resolved materials path (fallback to default auto dir if empty).
+  if (s->ed_materials) {
+    std::wstring dir = TaskMaterialsDirResolved(t);
+    SetWindowTextW(s->ed_materials, dir.c_str());
+  }
   DateTime_SetSystemtime(s->dt_start, GDT_VALID, &t.start);
   DateTime_SetSystemtime(s->dt_end, GDT_VALID, &t.end);
   SendMessageW(s->cb_status, CB_SETCURSEL, ComboSelFromStatus(t.status), 0);
@@ -3532,6 +3550,12 @@ static void TaskClearFields(TaskWindowState* s) {
   if (!s->app->categories.empty()) SetWindowTextW(s->cb_category, s->app->categories[0].c_str());
   SetWindowTextW(s->ed_title, L"");
   SetWindowTextW(s->ed_basis, L"");
+  // New task: generate a draft id so materials folder can be opened/selected immediately.
+  s->draft_task_id = NewTaskId();
+  if (s->ed_materials) {
+    std::wstring dir = GetTaskMaterialsDirById(s->draft_task_id);
+    SetWindowTextW(s->ed_materials, dir.c_str());
+  }
   SetEditText(s->re_desc, L"");
   SendMessageW(s->cb_status, CB_SETCURSEL, 1, 0);
   SYSTEMTIME now{};
@@ -3546,6 +3570,7 @@ static bool TaskReadFields(TaskWindowState* s, Task* out, std::wstring* err) {
   out->category = TrimWs(GetWindowTextWString(s->cb_category));
   out->title = TrimWs(GetWindowTextWString(s->ed_title));
   out->basis = TrimWs(GetWindowTextWString(s->ed_basis));
+  out->materials_dir = TrimWs(GetWindowTextWString(s->ed_materials));
   out->desc_plain = GetWindowTextWString(s->re_desc);
   if (!out->desc_plain.empty()) {
     std::string rtf = RichEditGetRtfBytes(s->re_desc);
@@ -4406,6 +4431,15 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       s->ed_basis = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                     WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | WS_TABSTOP,
                                     0, 0, 10, 10, hwnd, (HMENU)15, nullptr, nullptr);
+      s->lbl_materials = CreateWindowExW(0, L"STATIC", L"材料目录(本地，可导出时建议放在 data 内)",
+                                         WS_CHILD | WS_VISIBLE,
+                                         0, 0, 10, 10, hwnd, (HMENU)27, nullptr, nullptr);
+      s->ed_materials = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_READONLY,
+                                        0, 0, 10, 10, hwnd, (HMENU)17, nullptr, nullptr);
+      s->btn_pick_dir = CreateWindowExW(0, L"BUTTON", L"设置路径",
+                                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                        0, 0, 10, 10, hwnd, (HMENU)12, nullptr, nullptr);
       s->lbl_start = CreateWindowExW(0, L"STATIC", L"开始日期",
                                      WS_CHILD | WS_VISIBLE,
                                      0, 0, 10, 10, hwnd, (HMENU)23, nullptr, nullptr);
@@ -4455,6 +4489,7 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                                       0, 0, 10, 10, hwnd, (HMENU)10, nullptr, nullptr);
 
       for (HWND h : {s->list, s->lbl_category, s->cb_category, s->lbl_title, s->ed_title, s->lbl_basis, s->ed_basis,
+                     s->lbl_materials, s->ed_materials, s->btn_pick_dir,
                      s->lbl_start, s->dt_start, s->lbl_end, s->dt_end, s->lbl_status, s->cb_status,
                      s->lbl_desc, s->re_desc,
                      s->btn_new, s->btn_save, s->btn_open_dir, s->btn_del, s->btn_close}) {
@@ -4478,6 +4513,7 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       SetEditCue(GetComboEditHandle(s->cb_category), L"任务分类，例如：项目/研发/学习");
       SetEditCue(s->ed_title, L"任务标题，例如：重构支付模块");
       SetEditCue(s->ed_basis, L"依据(可选)：会议/需求/故障单/邮件等");
+      SetEditCue(s->ed_materials, L"(未设置时，保存会自动创建默认目录)");
       SetEditCue(s->re_desc, L"任务说明(可选)：目标、范围、验收标准、风险、依赖等");
       return 0;
     }
@@ -4511,6 +4547,18 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       MoveWindow(s->lbl_basis, x, y, right_w, lbl, TRUE);
       y += lbl + gap;
       MoveWindow(s->ed_basis, x, y, right_w, row, TRUE);
+      y += row + pad;
+
+      MoveWindow(s->lbl_materials, x, y, right_w, lbl, TRUE);
+      y += lbl + gap;
+      // Materials row: readonly edit + set button + open button.
+      int mbtn_w = ScalePx(hwnd, 92);
+      int mbtn_gap = pad;
+      int edit_w = right_w - (mbtn_w * 2 + mbtn_gap);
+      if (edit_w < ScalePx(hwnd, 120)) edit_w = ScalePx(hwnd, 120);
+      MoveWindow(s->ed_materials, x, y, edit_w, row, TRUE);
+      MoveWindow(s->btn_pick_dir, x + edit_w + mbtn_gap, y, mbtn_w, row, TRUE);
+      MoveWindow(s->btn_open_dir, x + edit_w + mbtn_gap + mbtn_w, y, mbtn_w, row, TRUE);
       y += row + pad;
 
       MoveWindow(s->lbl_start, x, y, right_w, lbl, TRUE);
@@ -4640,6 +4688,13 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         SetFocus(h ? h : s->cb_category);
         return 0;
       }
+      if (id == 12) {  // pick materials dir
+        std::wstring picked;
+        if (!PickFolderDialog(hwnd, L"选择材料目录(本地)", &picked)) return 0;
+        if (!ConfirmMaterialsPathIfExternal(hwnd, picked)) return 0;
+        SetWindowTextW(s->ed_materials, picked.c_str());
+        return 0;
+      }
       if (id == 8) {  // save (add or update)
         Task t{};
         std::wstring e;
@@ -4650,11 +4705,16 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         int idx = TaskGetSelectedIndex(s);
         if (idx >= 0 && idx < (int)s->working.size()) {
           t.id = s->working[(size_t)idx].id;
+          // Preserve materials dir if user didn't change it (or old data had it empty).
+          if (t.materials_dir.empty()) t.materials_dir = s->working[(size_t)idx].materials_dir;
           s->working[(size_t)idx] = t;
         } else {
-          t.id = NewTaskId();
+          t.id = !s->draft_task_id.empty() ? s->draft_task_id : NewTaskId();
+          // New task must have a materials directory. If user didn't set one, auto-create the default under data.
+          if (t.materials_dir.empty()) t.materials_dir = GetTaskMaterialsDirById(t.id);
           s->working.push_back(t);
           idx = (int)s->working.size() - 1;
+          s->draft_task_id.clear();
         }
 
         std::wstring err;
@@ -4665,7 +4725,7 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
         // Ensure each long-term task has a stable materials folder.
         // We intentionally do NOT delete it when the task is deleted, to avoid data loss.
-        (void)GetTaskMaterialsDirById(t.id);
+        if (t.materials_dir.empty()) (void)GetTaskMaterialsDirById(t.id);
         s->app->tasks = s->working;
 
         TaskRefreshList(s);
@@ -4676,7 +4736,18 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       if (id == 11) {  // open materials dir
         int idx = TaskGetSelectedIndex(s);
         if (idx < 0 || idx >= (int)s->working.size()) {
-          ShowInfoBox(hwnd, L"请先在左侧列表选择一个任务。", L"提示");
+          // No selection: open draft task dir (new task) if present.
+          std::wstring dir = TrimWs(GetWindowTextWString(s->ed_materials));
+          if (!dir.empty()) {
+            if (IsNetworkPathForbidden(dir)) {
+              ShowInfoBox(hwnd, L"材料路径为网络共享(UNC)，出于安全考虑已禁止打开。请改为本地目录。", L"提示");
+              return 0;
+            }
+            if (!DirExistsW(dir)) EnsureDirExists(dir);
+            ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            return 0;
+          }
+          ShowInfoBox(hwnd, L"请先在左侧列表选择一个任务，或先点击“新建”。", L"提示");
           return 0;
         }
         const Task& t = s->working[(size_t)idx];

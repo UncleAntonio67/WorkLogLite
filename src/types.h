@@ -28,8 +28,9 @@ struct Entry {
   std::wstring materials_dir;
 
   std::wstring category;    // user-defined
-  std::wstring start_time;  // "HH:MM" or empty
-  std::wstring end_time;    // "HH:MM" or empty
+  // Main UI now writes YYYY-MM-DD for date ranges; legacy data may still contain HH:MM.
+  std::wstring start_time;
+  std::wstring end_time;
   std::wstring title;
   EntryStatus status{EntryStatus::None};
 

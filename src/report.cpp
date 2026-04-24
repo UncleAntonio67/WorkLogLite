@@ -57,6 +57,13 @@ static const wchar_t* StatusToCN(EntryStatus s) {
 
 static std::wstring TimeRange(const Entry& e) {
   if (e.start_time.empty() && e.end_time.empty()) return L"";
+  SYSTEMTIME start{};
+  SYSTEMTIME end{};
+  if (!e.start_time.empty() && !e.end_time.empty() &&
+      ParseYYYYMMDD(e.start_time, &start) && ParseYYYYMMDD(e.end_time, &end)) {
+    return e.start_time + L" ~ " + e.end_time;
+  }
+
   std::wstring st = e.start_time.empty() ? L"??:??" : e.start_time;
   std::wstring et = e.end_time.empty() ? L"??:??" : e.end_time;
   return st + L"-" + et;

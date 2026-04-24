@@ -74,6 +74,16 @@ static bool WriteFileUtf8Atomic(const std::wstring& path, const std::string& byt
 }
 
 std::wstring GetDataRootDir() {
+  wchar_t override[MAX_PATH * 4]{};
+  DWORD n = GetEnvironmentVariableW(L"WORKLOGLITE_DATA_DIR", override, (DWORD)_countof(override));
+  if (n > 0 && n < _countof(override)) {
+    std::wstring dir = override;
+    if (!dir.empty()) {
+      EnsureDirExists(dir);
+      return dir;
+    }
+  }
+
   std::wstring portable = JoinPath(GetExeDir(), L"data");
   if (EnsureDirExists(portable)) return portable;
 
@@ -162,6 +172,31 @@ static bool ShouldPersistEntry(const Entry& e) {
     bool has_meeting_any = !e.body_plain.empty() || !e.body_rtf_b64.empty() || !e.materials_dir.empty() ||
                            !e.start_time.empty() || !e.end_time.empty();
     return has_meeting_any;
+  }
+  return true;
+}
+
+static int CompareDateOnly(const SYSTEMTIME& a, const SYSTEMTIME& b) {
+  if (a.wYear != b.wYear) return a.wYear < b.wYear ? -1 : 1;
+  if (a.wMonth != b.wMonth) return a.wMonth < b.wMonth ? -1 : 1;
+  if (a.wDay != b.wDay) return a.wDay < b.wDay ? -1 : 1;
+  return 0;
+}
+
+static bool ValidateEntryDateRange(const Entry& e, std::wstring* err) {
+  if (e.start_time.empty() || e.end_time.empty()) return true;
+
+  SYSTEMTIME start{};
+  SYSTEMTIME end{};
+  if (!ParseYYYYMMDD(e.start_time, &start) || !ParseYYYYMMDD(e.end_time, &end)) return true;
+
+  if (CompareDateOnly(start, end) >= 0) {
+    if (err) {
+      std::wstring label = e.title.empty() ? e.id : e.title;
+      if (label.empty()) label = L"(unnamed entry)";
+      *err = L"Invalid entry date range: " + label + L" (" + e.start_time + L" ~ " + e.end_time + L")";
+    }
+    return false;
   }
   return true;
 }
@@ -384,6 +419,7 @@ bool SaveDayFile(const DayData& day, std::wstring* err) {
 
   for (const auto& e : day.entries) {
     if (!ShouldPersistEntry(e)) continue;
+    if (!ValidateEntryDateRange(e, err)) return false;
 
     out += "ENTRY\n";
     WriteField(out, "id", e.id.empty() ? L"e" : e.id);

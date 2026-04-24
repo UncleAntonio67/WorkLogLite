@@ -19,6 +19,26 @@ static bool DateGeq(const SYSTEMTIME& a, const SYSTEMTIME& b) {
   return DateLeq(b, a);
 }
 
+static bool ValidateTaskForSave(const Task& t, std::wstring* err) {
+  if (t.id.empty()) {
+    if (err) *err = L"Failed to save task: missing id.";
+    return false;
+  }
+  if (t.title.empty()) {
+    if (err) *err = L"Failed to save task: missing title.";
+    return false;
+  }
+  if (t.start.wYear == 0 || t.end.wYear == 0) {
+    if (err) *err = L"Failed to save task: missing start/end date.";
+    return false;
+  }
+  if (DateGeq(t.start, t.end)) {
+    if (err) *err = L"Failed to save task: end date must be later than start date for " + t.title;
+    return false;
+  }
+  return true;
+}
+
 std::wstring GetTasksFilePath() {
   return JoinPath(GetDataRootDir(), L"tasks.wlt");
 }
@@ -189,7 +209,7 @@ bool SaveTasks(const std::vector<Task>& tasks, std::wstring* err) {
   std::string out;
   out += "WLT2\n";
   for (const auto& t : tasks) {
-    if (t.id.empty() || t.title.empty()) continue;
+    if (!ValidateTaskForSave(t, err)) return false;
     out += "TASK\n";
     out += "id=" + WideToUtf8(t.id) + "\n";
     out += "category_b64=" + Base64Encode(WideToUtf8(t.category)) + "\n";

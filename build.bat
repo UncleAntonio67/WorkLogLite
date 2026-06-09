@@ -45,6 +45,14 @@ exit /b 1
 
 :build_msvc
 if not exist build mkdir build
+if not exist build\obj mkdir build\obj
+set RES=
+where rc >nul 2>nul
+if not errorlevel 1 (
+  rc /nologo /fo build\app.res app.rc
+  if errorlevel 1 goto :build_fail
+  set RES=build\app.res
+)
 
 cl ^
   /utf-8 ^
@@ -53,17 +61,26 @@ cl ^
   /DWINVER=0x0601 /D_WIN32_WINNT=0x0601 /D_WIN32_IE=0x0600 ^
   /O2 /MT ^
   /W4 /wd4100 /wd4505 ^
+  /Fo:build\obj\ ^
   /Fe:build\WorkLogLite.new.exe ^
   %SOURCES% ^
-  user32.lib gdi32.lib comctl32.lib comdlg32.lib shlwapi.lib ole32.lib shell32.lib crypt32.lib bcrypt.lib
+  %RES% ^
+  user32.lib gdi32.lib comctl32.lib comdlg32.lib shlwapi.lib ole32.lib shell32.lib crypt32.lib bcrypt.lib uuid.lib
 
 if errorlevel 1 goto :build_fail
 goto :build_done
 
 :build_mingw
 if not exist build mkdir build
+set RES=
 
 set "PATH=%~dp0.toolchain\w64devkit\w64devkit\bin;%PATH%"
+where windres >nul 2>nul
+if not errorlevel 1 (
+  windres app.rc -O coff -o build\app_res.o
+  if errorlevel 1 goto :build_fail
+  set RES=build\app_res.o
+)
 
 echo.
 echo Using bundled MinGW toolchain:
@@ -78,6 +95,7 @@ echo.
   -static -static-libgcc -static-libstdc++ ^
   -o build\WorkLogLite.new.exe ^
   %SOURCES% ^
+  %RES% ^
   -luser32 -lgdi32 -lcomctl32 -lcomdlg32 -lshlwapi -lole32 -lshell32 -lcrypt32 -lbcrypt -luuid
 
 if errorlevel 1 goto :build_fail

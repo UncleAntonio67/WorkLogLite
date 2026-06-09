@@ -1,7 +1,9 @@
-#include "categories.h"
+﻿#include "categories.h"
 #include "audio_record.h"
+#include "app_resource.h"
 #include "demo.h"
 #include "color_picker.h"
+#include "data_ops.h"
 #include "report.h"
 #include "storage.h"
 #include "tasks.h"
@@ -20,6 +22,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <cmath>
 #include <cwctype>
 #include <cstring>
 #include <sstream>
@@ -49,8 +52,6 @@ enum : UINT {
   IDM_PREVIEW_DAY = 1021,
   IDM_MANAGE_TASKS = 1030,
   IDM_GENERATE_DEMO_DATA = 1050,
-  IDM_CHANGE_PASSWORD = 1060,
-  IDM_DISABLE_PASSWORD_LOGIN = 1061,
   IDM_VIEW_TASK_PROGRESS = 1062,
   IDM_HELP = 1100,
 
@@ -104,6 +105,7 @@ enum : int {
   IDC_BTN_RECORD_MIC = 2072,
   IDC_BTN_COLOR_PICKER = 2073,
   IDC_BTN_PASTE_PLAIN = 2074,
+  IDC_BTN_DATE_SEPARATOR = 2075,
   IDC_STATUS = 2020,
   IDC_CB_STATUS = 2021,
   IDC_LBL_CATEGORY = 2030,
@@ -125,6 +127,10 @@ enum : int {
   IDC_FMT_INDENT_INC = 2048,
   IDC_FMT_INDENT_DEC = 2049,
   IDC_FMT_CLEAR = 2050,
+  IDC_FMT_SUPERSCRIPT = 2052,
+  IDC_FMT_SUBSCRIPT = 2053,
+  IDC_FMT_MARKDOWN = 2054,
+  IDC_BTN_BODY_MAXIMIZE = 2051,
 };
 
 struct AppState {
@@ -147,6 +153,7 @@ struct AppState {
   HWND btn_record_mic{};
   HWND btn_color_picker{};
   HWND btn_paste_plain{};
+  HWND btn_date_separator{};
   HWND lbl_category{};
   HWND lbl_start{};
   HWND lbl_end{};
@@ -164,6 +171,10 @@ struct AppState {
   HWND fmt_indent_inc{};
   HWND fmt_indent_dec{};
   HWND fmt_clear{};
+  HWND fmt_markdown{};
+  HWND fmt_superscript{};
+  HWND fmt_subscript{};
+  HWND btn_body_maximize{};
   HWND cb_category{};
   HWND ed_start{};
   HWND ed_end{};
@@ -181,8 +192,12 @@ struct AppState {
   DayData day{};
   int editing_index{-1};  // -1 => new entry
   bool editor_dirty{false};
+  bool editor_maximized{false};
+  int body_zoom_percent{100};
   bool ignore_cal_selchange{false};  // avoid repeated prompts when we programmatically revert calendar selection
   bool suppress_dirty_prompt{false};  // avoid re-entrant prompts triggered by programmatic UI updates while saving
+  bool suppress_editor_change_tracking{false};  // ignore control notifications during programmatic editor fills
+  bool close_in_progress{false};
 
   // Small "toast" messages shown in the status bar (e.g. "copied to clipboard").
   std::wstring toast;
@@ -193,6 +208,7 @@ struct AppState {
   ULONGLONG focus_end_tick{0};
   UINT_PTR focus_timer_id{0};
   UINT_PTR audio_timer_id{0};
+  UINT_PTR autosave_timer_id{0};
   AudioRecorder* system_recorder{};
   AudioRecorder* mic_recorder{};
   ULONGLONG system_record_start_tick{0};
@@ -200,6 +216,8 @@ struct AppState {
 
   std::vector<std::wstring> categories;
   std::vector<Task> tasks;
+  int list_sort_column{0};  // 0=start/date range, 1=category, 3=status
+  bool list_sort_desc{false};
 
   // Optional materials directory selected for the current editor content (used for new entries too).
   std::wstring editor_materials_dir;
@@ -210,6 +228,10 @@ static std::wstring NormalizeNewlinesToCrlf(const std::wstring& s);
 static bool CopyToClipboard(HWND hwnd, const std::wstring& text);
 static bool WriteUtf8File(const std::wstring& path, const std::wstring& content, std::wstring* err);
 static bool ReadFileUtf8Simple(const std::wstring& path, std::wstring* out, std::wstring* err);
+static bool EditorMatchesDefaultDraft(AppState* s);
+static int CompareDateYmd(const std::wstring& a, const std::wstring& b);
+static std::vector<int> GetSelectedEntryIndices(AppState* s);
+static void RenderMarkdownToRichEdit(HWND rich, HFONT font, const std::wstring& md);
 static void OpenDataDir(AppState* s);
 static std::wstring ParentDirOf(const std::wstring& path);
 static std::wstring JoinPathLoose(const std::wstring& a, const std::wstring& b);
@@ -222,6 +244,8 @@ static std::wstring GetWorkMaterialsDir(const SYSTEMTIME& date, const std::wstri
 static bool IsNetworkPathForbidden(const std::wstring& path);
 static int CompareSystemTimeDateOnly(const SYSTEMTIME& a, const SYSTEMTIME& b);
 static void TaskInitListColumns(HWND list);
+static void ShowUnitCalcWindow(HWND owner);
+static void Layout(AppState* s);
 
 static bool IsEditorTrulyDirty(AppState* s);
 static void SetEditorDirty(AppState* s, bool dirty);
@@ -320,15 +344,16 @@ static void ComputeMainMinClientSize(HWND hwnd, AppState* s, int* out_w, int* ou
   int h_no_status_need = y + pad + min_body_h;
 
   // Left office panel: number of buttons determines required rows.
-  int office_btn_count = 11;  // conservative fallback (current shipped count)
+  int office_btn_count = 15;  // conservative fallback (current shipped count)
   if (s) {
     office_btn_count = 0;
     for (HWND b : {s->btn_screenshot, s->btn_quick_reply, s->btn_timestamp, s->btn_focus_timer, s->btn_calc,
                    s->btn_data_dir, s->btn_screenshot_dir, s->btn_color_picker, s->btn_paste_plain,
-                   s->btn_record_system, s->btn_record_mic}) {
+                   s->btn_record_system, s->btn_record_mic, s->btn_task_materials, s->btn_open_materials,
+                   s->btn_set_materials, s->btn_date_separator}) {
       if (b) office_btn_count++;
     }
-    if (office_btn_count <= 0) office_btn_count = 11;
+    if (office_btn_count <= 0) office_btn_count = 15;
   }
   int cols = 2;
   int rows = (office_btn_count + cols - 1) / cols;
@@ -496,6 +521,20 @@ static void RichToggleCharEffect(HWND rich, DWORD effect_flag) {
   SendMessageW(rich, EM_SETCHARFORMAT, (WPARAM)SCF_SELECTION, (LPARAM)&out);
 }
 
+static void RichToggleScriptEffect(HWND rich, DWORD effect_flag, DWORD other_flag) {
+  if (!rich) return;
+  CHARFORMAT2W cf{};
+  cf.cbSize = sizeof(cf);
+  SendMessageW(rich, EM_GETCHARFORMAT, (WPARAM)SCF_SELECTION, (LPARAM)&cf);
+
+  bool enabled = (cf.dwEffects & effect_flag) != 0;
+  CHARFORMAT2W out{};
+  out.cbSize = sizeof(out);
+  out.dwMask = effect_flag | other_flag;
+  out.dwEffects = enabled ? 0 : effect_flag;
+  SendMessageW(rich, EM_SETCHARFORMAT, (WPARAM)SCF_SELECTION, (LPARAM)&out);
+}
+
 static void RichToggleBullet(HWND rich) {
   if (!rich) return;
   PARAFORMAT2 pf{};
@@ -510,17 +549,17 @@ static void RichToggleBullet(HWND rich) {
   SendMessageW(rich, EM_SETPARAFORMAT, 0, (LPARAM)&out);
 }
 
-static void RichToggleNumbering(HWND rich) {
+static void RichToggleNumberingStyle(HWND rich, WORD numbering_kind, WORD numbering_style) {
   if (!rich) return;
   PARAFORMAT2 pf{};
   pf.cbSize = sizeof(pf);
   SendMessageW(rich, EM_GETPARAFORMAT, 0, (LPARAM)&pf);
-  bool is_numbered = (pf.wNumbering != 0 && pf.wNumbering != PFN_BULLET);
+  bool is_same_numbered = (pf.wNumbering == numbering_kind && pf.wNumberingStyle == numbering_style);
 
   PARAFORMAT2 out{};
   out.cbSize = sizeof(out);
   out.dwMask = PFM_NUMBERING | PFM_NUMBERINGSTYLE | PFM_NUMBERINGSTART | PFM_NUMBERINGTAB | PFM_STARTINDENT | PFM_OFFSET;
-  if (is_numbered) {
+  if (is_same_numbered) {
     out.wNumbering = 0;
     out.wNumberingStyle = 0;
     out.wNumberingStart = 0;
@@ -528,15 +567,19 @@ static void RichToggleNumbering(HWND rich) {
     out.dxStartIndent = 0;
     out.dxOffset = 0;
   } else {
-    // A reasonable default numbering format.
+    // Keep numbering compact; avoid shifting paragraph text too far right.
     out.wNumbering = PFN_ARABIC;
     out.wNumberingStyle = PFNS_PERIOD;
     out.wNumberingStart = 1;
-    out.wNumberingTab = 360;   // 0.25"
-    out.dxStartIndent = 720;   // 0.5"
-    out.dxOffset = -360;       // hanging indent (number is left of text)
+    out.wNumberingTab = 0;
+    out.dxStartIndent = 0;
+    out.dxOffset = 0;
   }
   SendMessageW(rich, EM_SETPARAFORMAT, 0, (LPARAM)&out);
+}
+
+static void RichToggleNumbering(HWND rich) {
+  RichToggleNumberingStyle(rich, PFN_ARABIC, PFNS_PERIOD);
 }
 
 static void RichSetParaAlignment(HWND rich, WORD align) {
@@ -658,9 +701,17 @@ static void SetDateCtrlOrDefault(HWND hwnd, const std::wstring& ymd, const SYSTE
 
 static void UpdateStatusBar(AppState* s) {
   if (!s->status) return;
-  // Part 1 is a static hint; part 0 is dynamic info.
-  std::wstring hint = L"快捷键: Ctrl+S 保存  Ctrl+N 新增  Ctrl+P 预览  Ctrl+K 分类  Ctrl+T 长期任务  F1 帮助";
-  SendMessageW(s->status, SB_SETTEXTW, 1, (LPARAM)hint.c_str());
+  // Part 2 is a static hint; part 0 is dynamic info; part 1 shows editor stats.
+  std::wstring hint = L"快捷键: Ctrl+S 保存  Ctrl+N 新增  Ctrl+P 预览  Ctrl+K 分类  F1 帮助";
+  SendMessageW(s->status, SB_SETTEXTW, 2, (LPARAM)hint.c_str());
+
+  std::wstring body = s->ed_body ? GetWindowTextWString(s->ed_body) : L"";
+  wchar_t stats[128]{};
+  wsprintfW(stats, L"字数 %d  缩放 %d%%  状态 %s",
+            (int)body.size(),
+            s->body_zoom_percent,
+            IsEditorTrulyDirty(s) ? L"未保存" : L"已保存");
+  SendMessageW(s->status, SB_SETTEXTW, 1, (LPARAM)stats);
 
   ULONGLONG now = GetTickCount64();
   if (now < s->toast_until && !s->toast.empty()) {
@@ -703,8 +754,56 @@ static void UpdateStatusBar(AppState* s) {
 static void ShowToast(AppState* s, const std::wstring& msg, int ms = 2200) {
   if (!s) return;
   s->toast = msg;
-  s->toast_until = GetTickCount64() + (ULONGLONG)std::max(500, ms);
+  s->toast_until = GetTickCount64() + (ULONGLONG)(std::max)(500, ms);
   UpdateStatusBar(s);
+}
+
+static void ApplyBodyZoom(AppState* s) {
+  if (!s || !s->ed_body) return;
+  int zoom = s->body_zoom_percent;
+  if (zoom < 50) zoom = 50;
+  if (zoom > 300) zoom = 300;
+  s->body_zoom_percent = zoom;
+  SendMessageW(s->ed_body, EM_SETZOOM, (WPARAM)zoom, 100);
+}
+
+static void SetBodyZoom(AppState* s, int zoom_percent) {
+  if (!s) return;
+  int old_zoom = s->body_zoom_percent;
+  s->body_zoom_percent = zoom_percent;
+  ApplyBodyZoom(s);
+  if (s->body_zoom_percent != old_zoom) {
+    UpdateStatusBar(s);
+    ShowToast(s, L"正文缩放 " + std::to_wstring(s->body_zoom_percent) + L"%", 1200);
+  }
+}
+
+static bool AdjustBodyZoomFromWheel(AppState* s, short wheel_delta) {
+  if (!s || !s->ed_body) return false;
+  int step = (wheel_delta > 0) ? 10 : -10;
+  int old_zoom = s->body_zoom_percent;
+  int next_zoom = old_zoom + step;
+  if (next_zoom < 50) next_zoom = 50;
+  if (next_zoom > 300) next_zoom = 300;
+  if (next_zoom == old_zoom) return true;
+  SetBodyZoom(s, next_zoom);
+  return true;
+}
+
+static LRESULT CALLBACK BodyEditSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                             UINT_PTR subclass_id, DWORD_PTR ref_data) {
+  auto* s = reinterpret_cast<AppState*>(ref_data);
+  if (msg == WM_MOUSEWHEEL) {
+    bool ctrl = (GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) != 0;
+    if (ctrl && s && s->ed_body == hwnd) {
+      short delta = GET_WHEEL_DELTA_WPARAM(wParam);
+      if (delta != 0 && AdjustBodyZoomFromWheel(s, delta)) return 0;
+    }
+  }
+  if (msg == WM_NCDESTROY) {
+    RemoveWindowSubclass(hwnd, BodyEditSubclassProc, subclass_id);
+  }
+  return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
 static const wchar_t* AudioSourceCn(AudioRecordSource source) {
@@ -714,6 +813,8 @@ static const wchar_t* AudioSourceCn(AudioRecordSource source) {
 static const wchar_t* AudioSourceShortCn(AudioRecordSource source) {
   return source == AudioRecordSource::MicrophoneCapture ? L"麦克" : L"系统";
 }
+
+static constexpr ULONGLONG kMaxAudioRecordMs = 5ULL * 60ULL * 60ULL * 1000ULL;
 
 static AudioRecorder** AudioRecorderSlot(AppState* s, AudioRecordSource source) {
   if (!s) return nullptr;
@@ -801,31 +902,38 @@ static bool PromptSaveRecordedAudio(HWND owner,
                                     AudioRecordSource source,
                                     const std::wstring& recorded_path,
                                     std::wstring* out_path,
-                                    bool* out_cancelled) {
+                                    bool* out_cancelled,
+                                    std::wstring* out_err) {
   if (out_path) out_path->clear();
   if (out_cancelled) *out_cancelled = false;
+  if (out_err) out_err->clear();
 
   std::wstring initial_dir = ParentDirOf(recorded_path);
   if (initial_dir.empty()) initial_dir = GetAudioRecordingsDir(source);
   std::wstring initial_name = GetPathFileNamePart(recorded_path);
   if (initial_name.empty()) initial_name = BuildDefaultAudioSaveName(source);
-  std::wstring initial = JoinPathLoose(initial_dir, initial_name);
 
   wchar_t filebuf[MAX_PATH * 4]{};
-  wcsncpy_s(filebuf, _countof(filebuf), initial.c_str(), _TRUNCATE);
+  wcsncpy_s(filebuf, _countof(filebuf), initial_name.c_str(), _TRUNCATE);
 
   wchar_t filter[] = L"WAV 音频 (*.wav)\0*.wav\0所有文件 (*.*)\0*.*\0\0";
   OPENFILENAMEW ofn{};
   ofn.lStructSize = sizeof(ofn);
   ofn.hwndOwner = owner;
   ofn.lpstrFilter = filter;
+  ofn.lpstrInitialDir = initial_dir.c_str();
   ofn.lpstrFile = filebuf;
   ofn.nMaxFile = (DWORD)_countof(filebuf);
   ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
   ofn.lpstrDefExt = L"wav";
   ofn.lpstrTitle = source == AudioRecordSource::MicrophoneCapture ? L"保存麦克风录音" : L"保存系统声音录音";
   if (!GetSaveFileNameW(&ofn)) {
-    if (out_cancelled) *out_cancelled = true;
+    DWORD dlg_err = CommDlgExtendedError();
+    if (dlg_err == 0) {
+      if (out_cancelled) *out_cancelled = true;
+    } else if (out_err) {
+      *out_err = L"打开保存录音对话框失败。(common-dialog error=" + std::to_wstring(dlg_err) + L")";
+    }
     return false;
   }
   if (out_path) *out_path = filebuf;
@@ -883,14 +991,16 @@ static void FinishAudioRecording(AppState* s, AudioRecordSource source) {
 
   std::wstring save_path;
   bool cancelled = false;
-  if (!PromptSaveRecordedAudio(s->hwnd, source, temp_path, &save_path, &cancelled)) {
+  std::wstring save_err;
+  if (!PromptSaveRecordedAudio(s->hwnd, source, temp_path, &save_path, &cancelled, &save_err)) {
     if (cancelled) {
       std::wstring folder = ParentDirOf(temp_path);
       if (!folder.empty()) ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
       ShowToast(s, std::wstring(AudioSourceCn(source)) + L"录音已保留到默认目录");
       return;
     }
-    ShowInfoBox(s->hwnd, L"打开保存窗口失败。录音已保留在默认目录。", L"录音保存");
+    std::wstring msg = save_err.empty() ? L"打开保存窗口失败。录音已保留在默认目录。" : save_err + L"\n\n录音已保留在默认目录。";
+    ShowInfoBox(s->hwnd, msg.c_str(), L"录音保存");
     return;
   }
 
@@ -903,6 +1013,17 @@ static void FinishAudioRecording(AppState* s, AudioRecordSource source) {
   if (!folder.empty()) ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
   ShellExecuteW(nullptr, L"open", save_path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
   ShowToast(s, std::wstring(AudioSourceCn(source)) + L"录音已保存");
+}
+
+static bool MaybeAutoStopAudioRecording(AppState* s, AudioRecordSource source) {
+  if (!s || !IsAudioRecording(s, source)) return false;
+  ULONGLONG* start_tick = AudioRecordStartTickSlot(s, source);
+  if (!start_tick || *start_tick == 0) return false;
+  ULONGLONG now = GetTickCount64();
+  if (now - *start_tick < kMaxAudioRecordMs) return false;
+  FinishAudioRecording(s, source);
+  ShowToast(s, std::wstring(AudioSourceCn(source)) + L"录音已达到 5 小时，已自动停止");
+  return true;
 }
 
 static void ToggleAudioRecording(AppState* s, AudioRecordSource source) {
@@ -1050,6 +1171,47 @@ static std::wstring GetQuickRepliesFilePath() {
   return JoinPath(GetDataRootDir(), L"quick_replies.txt");
 }
 
+static std::wstring GetScratchpadFilePath() {
+  return JoinPath(GetDataRootDir(), L"scratchpad.txt");
+}
+
+static void OpenScratchpadFile(HWND owner) {
+  EnsureDirExists(GetDataRootDir());
+  std::wstring path = GetScratchpadFilePath();
+  if (!FileExists(path)) {
+    std::wstring err;
+    if (!WriteUtf8File(path, L"", &err)) {
+      ShowInfoBox(owner, err.c_str(), L"便签");
+      return;
+    }
+  }
+  HINSTANCE r = ShellExecuteW(nullptr, L"open", L"notepad.exe", path.c_str(), nullptr, SW_SHOWNORMAL);
+  if ((INT_PTR)r <= 32) ShowInfoBox(owner, L"无法打开便签文件。", L"便签");
+}
+
+static bool OpenPathInShell(HWND owner, const std::wstring& path, const wchar_t* what) {
+  if (path.empty()) {
+    ShowInfoBox(owner, L"路径为空，无法打开。", what ? what : L"提示");
+    return false;
+  }
+  HINSTANCE r = ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  if ((INT_PTR)r <= 32) {
+    std::wstring msg = L"无法打开路径：\n" + path;
+    ShowInfoBox(owner, msg.c_str(), what ? what : L"提示");
+    return false;
+  }
+  return true;
+}
+
+static void OpenSelectedDayFolder(AppState* s) {
+  if (!s) return;
+  std::wstring path = GetDayFilePath(s->selected);
+  std::wstring dir = ParentDirOf(path);
+  if (dir.empty()) return;
+  EnsureDirExists(dir);
+  ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
 static std::vector<std::wstring> ParseQuickRepliesContent(const std::wstring& content) {
   // New format (recommended): blocks separated by a line that is exactly "---".
   // This supports multi-line replies and blank lines.
@@ -1155,6 +1317,73 @@ static void PastePlainTextIntoBody(AppState* s) {
   ShowToast(s, L"已按纯文本粘贴");
 }
 
+static void InsertDateSeparatorIntoBody(AppState* s) {
+  if (!s) return;
+  SYSTEMTIME st{};
+  GetLocalTime(&st);
+  wchar_t line[32]{};
+  wsprintfW(line, L"----%04d%02d%02d----", (int)st.wYear, (int)st.wMonth, (int)st.wDay);
+
+  if (!s->ed_body) return;
+  SetFocus(s->ed_body);
+
+  CHARRANGE before{};
+  SendMessageW(s->ed_body, EM_EXGETSEL, 0, (LPARAM)&before);
+  CHARFORMAT2W base_cf{};
+  base_cf.cbSize = sizeof(base_cf);
+  SendMessageW(s->ed_body, EM_GETCHARFORMAT, (WPARAM)SCF_SELECTION, (LPARAM)&base_cf);
+
+  std::wstring insert_text;
+  LONG prefix_len = 0;
+  if (before.cpMin > 0) {
+    wchar_t prev[2]{};
+    TEXTRANGEW tr{};
+    tr.chrg.cpMin = before.cpMin - 1;
+    tr.chrg.cpMax = before.cpMin;
+    tr.lpstrText = prev;
+    SendMessageW(s->ed_body, EM_GETTEXTRANGE, 0, (LPARAM)&tr);
+    if (prev[0] != L'\n' && prev[0] != L'\r') {
+      insert_text += L"\r\n";
+      prefix_len = 2;
+    }
+  }
+  insert_text += line;
+  insert_text += L"\r\n";
+
+  SendMessageW(s->ed_body, EM_REPLACESEL, TRUE, (LPARAM)insert_text.c_str());
+  LONG line_len = (LONG)wcslen(line);
+  LONG line_start = before.cpMin + prefix_len;
+  LONG line_end = line_start + line_len;
+  if (line_start >= 0 && line_end >= line_start) {
+    CHARRANGE cr{};
+    cr.cpMin = line_start;
+    cr.cpMax = line_end;
+    SendMessageW(s->ed_body, EM_EXSETSEL, 0, (LPARAM)&cr);
+    CHARFORMAT2W bold_cf = base_cf;
+    bold_cf.cbSize = sizeof(bold_cf);
+    bold_cf.dwMask |= CFM_BOLD | CFM_FACE | CFM_SIZE | CFM_CHARSET | CFM_COLOR;
+    bold_cf.dwEffects |= CFE_BOLD;
+    SendMessageW(s->ed_body, EM_SETCHARFORMAT, (WPARAM)SCF_SELECTION, (LPARAM)&bold_cf);
+
+    CHARRANGE after{};
+    SendMessageW(s->ed_body, EM_EXGETSEL, 0, (LPARAM)&after);
+    cr.cpMin = after.cpMax;
+    cr.cpMax = after.cpMax;
+    SendMessageW(s->ed_body, EM_EXSETSEL, 0, (LPARAM)&cr);
+
+    CHARFORMAT2W clear_cf = base_cf;
+    clear_cf.cbSize = sizeof(clear_cf);
+    clear_cf.dwMask |= CFM_BOLD | CFM_FACE | CFM_SIZE | CFM_CHARSET | CFM_COLOR;
+    clear_cf.dwEffects &= ~CFE_BOLD;
+    SendMessageW(s->ed_body, EM_SETCHARFORMAT, (WPARAM)SCF_SELECTION, (LPARAM)&clear_cf);
+  }
+
+  SetEditorDirty(s, true);
+  SendMessageW(s->ed_body, EM_SETMODIFY, TRUE, 0);
+  UpdateStatusBar(s);
+  ShowToast(s, L"已插入时间分隔符");
+}
+
 static void PickBodyTextColor(AppState* s) {
   if (!s) return;
   COLORREF color = RGB(0, 0, 0);
@@ -1216,6 +1445,410 @@ static void ShowQuickReplyMenu(AppState* s) {
   ShowToast(s, L"常用回复已复制到剪贴板");
 }
 
+enum : int {
+  IDC_UCALC_VALUE = 17001,
+  IDC_UCALC_FROM = 17002,
+  IDC_UCALC_TO = 17003,
+  IDC_UCALC_RESULT = 17004,
+  IDC_UCALC_SIZE = 17005,
+  IDC_UCALC_SIZE_UNIT = 17006,
+  IDC_UCALC_DURATION = 17007,
+  IDC_UCALC_DURATION_UNIT = 17008,
+  IDC_UCALC_BW_RESULT = 17009,
+  IDC_UCALC_COPY = 17010,
+  IDC_UCALC_SYSTEM = 17011,
+  IDC_UCALC_CLOSE = 17012,
+};
+
+struct UnitCalcUnit {
+  const wchar_t* label;
+  double bytes;
+  bool is_rate;
+};
+
+struct UnitCalcTimeUnit {
+  const wchar_t* label;
+  double seconds;
+};
+
+static const UnitCalcUnit kUnitCalcUnits[] = {
+    {L"B", 1.0, false},
+    {L"KB", 1000.0, false},
+    {L"MB", 1000.0 * 1000.0, false},
+    {L"GB", 1000.0 * 1000.0 * 1000.0, false},
+    {L"TB", 1000.0 * 1000.0 * 1000.0 * 1000.0, false},
+    {L"KiB", 1024.0, false},
+    {L"MiB", 1024.0 * 1024.0, false},
+    {L"GiB", 1024.0 * 1024.0 * 1024.0, false},
+    {L"TiB", 1024.0 * 1024.0 * 1024.0 * 1024.0, false},
+    {L"bps", 1.0 / 8.0, true},
+    {L"Kbps", 1000.0 / 8.0, true},
+    {L"Mbps", 1000.0 * 1000.0 / 8.0, true},
+    {L"Gbps", 1000.0 * 1000.0 * 1000.0 / 8.0, true},
+    {L"B/s", 1.0, true},
+    {L"KB/s", 1000.0, true},
+    {L"MB/s", 1000.0 * 1000.0, true},
+    {L"GB/s", 1000.0 * 1000.0 * 1000.0, true},
+};
+
+static const int kUnitCalcDataUnitIndexes[] = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+
+static const UnitCalcTimeUnit kUnitCalcTimeUnits[] = {
+    {L"秒", 1.0},
+    {L"分钟", 60.0},
+    {L"小时", 3600.0},
+    {L"天", 86400.0},
+};
+
+struct UnitCalcWindowState {
+  HWND hwnd{};
+  HWND st_convert{};
+  HWND st_bandwidth{};
+  HWND ed_value{};
+  HWND cb_from{};
+  HWND cb_to{};
+  HWND ed_result{};
+  HWND ed_size{};
+  HWND cb_size_unit{};
+  HWND ed_duration{};
+  HWND cb_duration_unit{};
+  HWND ed_bw_result{};
+  HWND btn_copy{};
+  HWND btn_system{};
+  HWND btn_close{};
+  HFONT font{};
+};
+
+static void CenterOwnedWindowSimple(HWND hwnd, HWND owner) {
+  if (!hwnd) return;
+  RECT rc{};
+  RECT wa{};
+  if (!GetWindowRect(hwnd, &rc)) return;
+  SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+  int width = rc.right - rc.left;
+  int height = rc.bottom - rc.top;
+  int x = wa.left + ((wa.right - wa.left) - width) / 2;
+  int y = wa.top + ((wa.bottom - wa.top) - height) / 2;
+  if (owner) {
+    RECT orc{};
+    if (GetWindowRect(owner, &orc)) {
+      x = orc.left + ((orc.right - orc.left) - width) / 2;
+      y = orc.top + ((orc.bottom - orc.top) - height) / 2;
+    }
+  }
+  if (x < wa.left) x = wa.left;
+  if (y < wa.top) y = wa.top;
+  if (x + width > wa.right) x = wa.right - width;
+  if (y + height > wa.bottom) y = wa.bottom - height;
+  SetWindowPos(hwnd, nullptr, x, y, 0, 0, SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+static bool TryParseDoubleText(const std::wstring& text, double* out) {
+  if (out) *out = 0.0;
+  const wchar_t* s = text.c_str();
+  while (*s && iswspace(*s)) s++;
+  if (!*s) return false;
+  wchar_t* end = nullptr;
+  double v = wcstod(s, &end);
+  if (end == s || !std::isfinite(v)) return false;
+  while (*end && iswspace(*end)) end++;
+  if (*end) return false;
+  if (out) *out = v;
+  return true;
+}
+
+static std::wstring FormatDoubleCompact(double value, int digits = 4) {
+  wchar_t buf[128]{};
+  swprintf_s(buf, L"%.*f", digits, value);
+  std::wstring out = buf;
+  while (!out.empty() && out.back() == L'0') out.pop_back();
+  if (!out.empty() && out.back() == L'.') out.pop_back();
+  if (out.empty()) out = L"0";
+  return out;
+}
+
+static void UnitCalcFillUnits(HWND combo, bool data_only) {
+  SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+  if (data_only) {
+    for (int idx : kUnitCalcDataUnitIndexes) {
+      LRESULT item = SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)kUnitCalcUnits[idx].label);
+      SendMessageW(combo, CB_SETITEMDATA, (WPARAM)item, (LPARAM)idx);
+    }
+    return;
+  }
+  for (int i = 0; i < (int)(sizeof(kUnitCalcUnits) / sizeof(kUnitCalcUnits[0])); i++) {
+    LRESULT item = SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)kUnitCalcUnits[i].label);
+    SendMessageW(combo, CB_SETITEMDATA, (WPARAM)item, (LPARAM)i);
+  }
+}
+
+static int UnitCalcGetComboUnitIndex(HWND combo) {
+  int sel = (int)SendMessageW(combo, CB_GETCURSEL, 0, 0);
+  if (sel < 0) return -1;
+  return (int)SendMessageW(combo, CB_GETITEMDATA, (WPARAM)sel, 0);
+}
+
+static void UnitCalcFillTimeUnits(HWND combo) {
+  SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+  for (int i = 0; i < (int)(sizeof(kUnitCalcTimeUnits) / sizeof(kUnitCalcTimeUnits[0])); i++) {
+    LRESULT item = SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)kUnitCalcTimeUnits[i].label);
+    SendMessageW(combo, CB_SETITEMDATA, (WPARAM)item, (LPARAM)i);
+  }
+}
+
+static int UnitCalcGetTimeUnitIndex(HWND combo) {
+  int sel = (int)SendMessageW(combo, CB_GETCURSEL, 0, 0);
+  if (sel < 0) return -1;
+  return (int)SendMessageW(combo, CB_GETITEMDATA, (WPARAM)sel, 0);
+}
+
+static void UpdateUnitCalcResults(UnitCalcWindowState* s) {
+  if (!s) return;
+
+  std::wstring convert_result = L"请输入数值并选择单位。";
+  double value = 0.0;
+  int from_idx = UnitCalcGetComboUnitIndex(s->cb_from);
+  int to_idx = UnitCalcGetComboUnitIndex(s->cb_to);
+  if (TryParseDoubleText(GetWindowTextWString(s->ed_value), &value) &&
+      from_idx >= 0 && to_idx >= 0) {
+    const UnitCalcUnit& from = kUnitCalcUnits[from_idx];
+    const UnitCalcUnit& to = kUnitCalcUnits[to_idx];
+    if (from.is_rate != to.is_rate) {
+      convert_result = L"大小单位和速率单位不能直接互转。";
+    } else {
+      double converted = value * from.bytes / to.bytes;
+      convert_result = FormatDoubleCompact(value) + L" " + from.label + L" = " +
+                       FormatDoubleCompact(converted) + L" " + to.label;
+    }
+  }
+  SetWindowTextW(s->ed_result, convert_result.c_str());
+
+  std::wstring bw_result = L"请输入文件大小和耗时，计算所需带宽。";
+  double size_value = 0.0;
+  double duration_value = 0.0;
+  int size_idx = UnitCalcGetComboUnitIndex(s->cb_size_unit);
+  int duration_idx = UnitCalcGetTimeUnitIndex(s->cb_duration_unit);
+  if (TryParseDoubleText(GetWindowTextWString(s->ed_size), &size_value) &&
+      TryParseDoubleText(GetWindowTextWString(s->ed_duration), &duration_value) &&
+      size_idx >= 0 && duration_idx >= 0) {
+    if (size_value < 0.0 || duration_value <= 0.0) {
+      bw_result = L"文件大小不能为负数，耗时必须大于 0。";
+    } else {
+      double total_bytes = size_value * kUnitCalcUnits[size_idx].bytes;
+      double total_seconds = duration_value * kUnitCalcTimeUnits[duration_idx].seconds;
+      double bytes_per_sec = total_bytes / total_seconds;
+      double mb_per_sec = bytes_per_sec / 1000.0 / 1000.0;
+      double mib_per_sec = bytes_per_sec / 1024.0 / 1024.0;
+      double mbps = bytes_per_sec * 8.0 / 1000.0 / 1000.0;
+      double gbps = mbps / 1000.0;
+      bw_result = L"需要带宽约:\r\n" +
+                  FormatDoubleCompact(mb_per_sec) + L" MB/s\r\n" +
+                  FormatDoubleCompact(mib_per_sec) + L" MiB/s\r\n" +
+                  FormatDoubleCompact(mbps) + L" Mbps\r\n" +
+                  FormatDoubleCompact(gbps) + L" Gbps";
+    }
+  }
+  SetWindowTextW(s->ed_bw_result, bw_result.c_str());
+}
+
+static LRESULT CALLBACK UnitCalcWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+  auto* s = reinterpret_cast<UnitCalcWindowState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+  switch (msg) {
+    case WM_CREATE: {
+      auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+      s = reinterpret_cast<UnitCalcWindowState*>(cs->lpCreateParams);
+      s->hwnd = hwnd;
+      SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(s));
+      s->font = CreateUiFont(hwnd);
+      DWORD edit_style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL;
+      DWORD ro_style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL;
+
+      s->st_convert = CreateWindowExW(0, L"STATIC", L"单位换算", WS_CHILD | WS_VISIBLE,
+                                      0, 0, 10, 10, hwnd, nullptr, nullptr, nullptr);
+      s->ed_value = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"1024", edit_style,
+                                    0, 0, 10, 10, hwnd, (HMENU)IDC_UCALC_VALUE, nullptr, nullptr);
+      s->cb_from = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_TABSTOP,
+                                   0, 0, 10, 10, hwnd, (HMENU)IDC_UCALC_FROM, nullptr, nullptr);
+      s->cb_to = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_TABSTOP,
+                                 0, 0, 10, 10, hwnd, (HMENU)IDC_UCALC_TO, nullptr, nullptr);
+      s->ed_result = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", ro_style,
+                                     0, 0, 10, 10, hwnd, (HMENU)IDC_UCALC_RESULT, nullptr, nullptr);
+
+      s->st_bandwidth = CreateWindowExW(0, L"STATIC", L"带宽需求", WS_CHILD | WS_VISIBLE,
+                                        0, 0, 10, 10, hwnd, nullptr, nullptr, nullptr);
+      s->ed_size = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"1", edit_style,
+                                   0, 0, 10, 10, hwnd, (HMENU)IDC_UCALC_SIZE, nullptr, nullptr);
+      s->cb_size_unit = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_TABSTOP,
+                                        0, 0, 10, 10, hwnd, (HMENU)IDC_UCALC_SIZE_UNIT, nullptr, nullptr);
+      s->ed_duration = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"10", edit_style,
+                                       0, 0, 10, 10, hwnd, (HMENU)IDC_UCALC_DURATION, nullptr, nullptr);
+      s->cb_duration_unit = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_TABSTOP,
+                                            0, 0, 10, 10, hwnd, (HMENU)IDC_UCALC_DURATION_UNIT, nullptr, nullptr);
+      s->ed_bw_result = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", ro_style,
+                                        0, 0, 10, 10, hwnd, (HMENU)IDC_UCALC_BW_RESULT, nullptr, nullptr);
+
+      s->btn_copy = CreateWindowExW(0, L"BUTTON", L"复制结果", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                    0, 0, 10, 10, hwnd, (HMENU)IDC_UCALC_COPY, nullptr, nullptr);
+      s->btn_system = CreateWindowExW(0, L"BUTTON", L"系统计算器", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                      0, 0, 10, 10, hwnd, (HMENU)IDC_UCALC_SYSTEM, nullptr, nullptr);
+      s->btn_close = CreateWindowExW(0, L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                     0, 0, 10, 10, hwnd, (HMENU)IDC_UCALC_CLOSE, nullptr, nullptr);
+
+      UnitCalcFillUnits(s->cb_from, false);
+      UnitCalcFillUnits(s->cb_to, false);
+      UnitCalcFillUnits(s->cb_size_unit, true);
+      UnitCalcFillTimeUnits(s->cb_duration_unit);
+      SendMessageW(s->cb_from, CB_SETCURSEL, 2, 0);
+      SendMessageW(s->cb_to, CB_SETCURSEL, 3, 0);
+      SendMessageW(s->cb_size_unit, CB_SETCURSEL, 3, 0);
+      SendMessageW(s->cb_duration_unit, CB_SETCURSEL, 1, 0);
+
+      for (HWND h : {s->st_convert, s->ed_value, s->cb_from, s->cb_to, s->ed_result,
+                     s->st_bandwidth, s->ed_size, s->cb_size_unit, s->ed_duration, s->cb_duration_unit,
+                     s->ed_bw_result, s->btn_copy, s->btn_system, s->btn_close}) {
+        SetControlFont(h, s->font);
+      }
+      UpdateUnitCalcResults(s);
+      return 0;
+    }
+    case WM_SIZE: {
+      if (!s) return 0;
+      int w = LOWORD(lParam);
+      int h = HIWORD(lParam);
+      int pad = ScalePx(hwnd, 10);
+      int row = ScalePx(hwnd, 28);
+      int lbl = ScalePx(hwnd, 18);
+      int btn_h = ScalePx(hwnd, 30);
+      int unit_w = ScalePx(hwnd, 102);
+
+      int x = pad;
+      int y = pad;
+      MoveWindow(s->st_convert, x, y, w - 2 * pad, lbl, TRUE);
+      y += lbl + ScalePx(hwnd, 6);
+
+      int value_w = w - 2 * pad - unit_w * 2 - pad * 2;
+      MoveWindow(s->ed_value, x, y, value_w, row, TRUE);
+      MoveWindow(s->cb_from, x + value_w + pad, y, unit_w, row + 220, TRUE);
+      MoveWindow(s->cb_to, x + value_w + pad * 2 + unit_w, y, unit_w, row + 220, TRUE);
+      y += row + pad;
+
+      int result_h = ScalePx(hwnd, 52);
+      MoveWindow(s->ed_result, x, y, w - 2 * pad, result_h, TRUE);
+      y += result_h + pad;
+
+      MoveWindow(s->st_bandwidth, x, y, w - 2 * pad, lbl, TRUE);
+      y += lbl + ScalePx(hwnd, 6);
+
+      int half_w = (w - 3 * pad) / 2;
+      int edit_w = half_w - unit_w - pad;
+      MoveWindow(s->ed_size, x, y, edit_w, row, TRUE);
+      MoveWindow(s->cb_size_unit, x + edit_w + pad, y, unit_w, row + 220, TRUE);
+      MoveWindow(s->ed_duration, x + half_w + pad, y, edit_w, row, TRUE);
+      MoveWindow(s->cb_duration_unit, x + half_w + pad + edit_w + pad, y, unit_w, row + 220, TRUE);
+      y += row + pad;
+
+      int bw_h = h - y - pad * 2 - btn_h;
+      if (bw_h < ScalePx(hwnd, 96)) bw_h = ScalePx(hwnd, 96);
+      MoveWindow(s->ed_bw_result, x, y, w - 2 * pad, bw_h, TRUE);
+      y += bw_h + pad;
+
+      int btn_w = ScalePx(hwnd, 96);
+      int sys_w = ScalePx(hwnd, 110);
+      int bx = w - pad - btn_w;
+      MoveWindow(s->btn_close, bx, y, btn_w, btn_h, TRUE);
+      bx -= pad + sys_w;
+      MoveWindow(s->btn_system, bx, y, sys_w, btn_h, TRUE);
+      bx -= pad + btn_w;
+      MoveWindow(s->btn_copy, bx, y, btn_w, btn_h, TRUE);
+      return 0;
+    }
+    case WM_COMMAND: {
+      int id = LOWORD(wParam);
+      int code = HIWORD(wParam);
+      if (id == IDC_UCALC_CLOSE) {
+        DestroyWindow(hwnd);
+        return 0;
+      }
+      if (id == IDC_UCALC_SYSTEM) {
+        HINSTANCE r = ShellExecuteW(nullptr, L"open", L"calc.exe", nullptr, nullptr, SW_SHOWNORMAL);
+        if ((INT_PTR)r <= 32) ShowInfoBox(hwnd, L"无法启动系统计算器(calc.exe)。", L"提示");
+        return 0;
+      }
+      if (id == IDC_UCALC_COPY) {
+        std::wstring text = L"单位换算:\r\n" + GetWindowTextWString(s->ed_result) +
+                            L"\r\n\r\n带宽需求:\r\n" + GetWindowTextWString(s->ed_bw_result);
+        if (!CopyToClipboard(hwnd, text)) ShowInfoBox(hwnd, L"复制失败。", L"提示");
+        return 0;
+      }
+      if ((id == IDC_UCALC_VALUE || id == IDC_UCALC_SIZE || id == IDC_UCALC_DURATION) && code == EN_CHANGE) {
+        UpdateUnitCalcResults(s);
+        return 0;
+      }
+      if ((id == IDC_UCALC_FROM || id == IDC_UCALC_TO || id == IDC_UCALC_SIZE_UNIT || id == IDC_UCALC_DURATION_UNIT) &&
+          code == CBN_SELCHANGE) {
+        UpdateUnitCalcResults(s);
+        return 0;
+      }
+      return 0;
+    }
+    case WM_CLOSE:
+      DestroyWindow(hwnd);
+      return 0;
+    case WM_DESTROY:
+      if (s && s->font) DeleteObject(s->font);
+      return 0;
+  }
+  return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ShowUnitCalcWindow(HWND owner) {
+  WNDCLASSW wc{};
+  wc.lpfnWndProc = UnitCalcWndProc;
+  wc.hInstance = GetModuleHandleW(nullptr);
+  wc.lpszClassName = L"WorkLogLiteUnitCalcWnd";
+  wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+  wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+  RegisterClassW(&wc);
+
+  UnitCalcWindowState state{};
+  HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, wc.lpszClassName, L"单位计算与带宽需求",
+                              WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 560, 430,
+                              owner, nullptr, wc.hInstance, &state);
+  if (!hwnd) {
+    ShowLastErrorBox(owner, L"CreateWindowEx(UnitCalc)");
+    return;
+  }
+  CenterOwnedWindowSimple(hwnd, owner);
+
+  EnableWindow(owner, FALSE);
+  while (IsWindow(hwnd)) {
+    MSG msg{};
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+      if (msg.message == WM_QUIT) {
+        PostQuitMessage((int)msg.wParam);
+        EnableWindow(owner, TRUE);
+        return;
+      }
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
+    WaitMessage();
+  }
+  EnableWindow(owner, TRUE);
+  SetForegroundWindow(owner);
+}
+
+static void SetEditorMaximized(AppState* s, bool maximized) {
+  if (!s) return;
+  s->editor_maximized = maximized;
+  if (s->btn_body_maximize) {
+    SetWindowTextW(s->btn_body_maximize, maximized ? L"还原编辑" : L"最大化编辑");
+  }
+  Layout(s);
+  InvalidateRect(s->hwnd, nullptr, TRUE);
+}
+
 static void ApplyBodyFormatting(AppState* s, void (*fn)(HWND)) {
   if (!s || !s->ed_body || !fn) return;
   // Ensure caret/selection state is owned by the RichEdit.
@@ -1238,21 +1871,38 @@ static void ApplyBodyFormatting2(AppState* s, void (*fn)(HWND, int), int arg) {
 static void BodyFmtBold(HWND rich) { RichToggleCharEffect(rich, CFE_BOLD); }
 static void BodyFmtItalic(HWND rich) { RichToggleCharEffect(rich, CFE_ITALIC); }
 static void BodyFmtUnderline(HWND rich) { RichToggleCharEffect(rich, CFE_UNDERLINE); }
+static void BodyFmtSuperscript(HWND rich) { RichToggleScriptEffect(rich, CFE_SUPERSCRIPT, CFE_SUBSCRIPT); }
+static void BodyFmtSubscript(HWND rich) { RichToggleScriptEffect(rich, CFE_SUBSCRIPT, CFE_SUPERSCRIPT); }
 static void BodyFmtBullet(HWND rich) { RichToggleBullet(rich); }
 static void BodyFmtNumbering(HWND rich) { RichToggleNumbering(rich); }
 static void BodyFmtClear(HWND rich) { RichClearFormatting(rich); }
 static void BodyFmtIndent(HWND rich, int twips) { RichAdjustIndent(rich, twips); }
 static void BodyFmtAlign(HWND rich, int align) { RichSetParaAlignment(rich, (WORD)align); }
 
+static void ApplyMarkdownStylingToBody(AppState* s) {
+  if (!s || !s->ed_body) return;
+  std::wstring md = GetWindowTextWString(s->ed_body);
+  if (md.empty()) return;
+  RenderMarkdownToRichEdit(s->ed_body, s->font, md);
+  SetEditorDirty(s, true);
+  SendMessageW(s->ed_body, EM_SETMODIFY, TRUE, 0);
+  UpdateStatusBar(s);
+  ShowToast(s, L"已应用 Markdown 样式");
+}
+
 static void UpdateStatusParts(AppState* s) {
   if (!s || !s->status) return;
   RECT rc{};
   GetClientRect(s->hwnd, &rc);
   int w = rc.right - rc.left;
-  int right_hint = w - ScalePx(s->hwnd, 520);
-  if (right_hint < ScalePx(s->hwnd, 220)) right_hint = w / 2;
-  int parts[2]{right_hint, -1};
-  SendMessageW(s->status, SB_SETPARTS, 2, (LPARAM)parts);
+  int hint_w = ScalePx(s->hwnd, 520);
+  int stats_w = ScalePx(s->hwnd, 240);
+  int first = w - hint_w - stats_w;
+  if (first < ScalePx(s->hwnd, 200)) first = ScalePx(s->hwnd, 200);
+  int second = first + stats_w;
+  if (second > w - ScalePx(s->hwnd, 160)) second = w - ScalePx(s->hwnd, 160);
+  int parts[3]{first, second, -1};
+  SendMessageW(s->status, SB_SETPARTS, 3, (LPARAM)parts);
 }
 
 static const wchar_t* StatusToCN(EntryStatus st) {
@@ -1320,24 +1970,46 @@ static COLORREF StatusBkColor(EntryStatus st) {
 }
 
 static void SetEditorDirty(AppState* s, bool dirty) {
+  if (!s) return;
   s->editor_dirty = dirty;
   // Simple affordance: append "*" to title bar when dirty.
   std::wstring title = kAppTitle;
   if (dirty) title += L" *";
   SetWindowTextW(s->hwnd, title.c_str());
+
+  bool want_autosave = dirty && s->editing_index >= 0;
+  if (want_autosave) {
+    if (s->autosave_timer_id) KillTimer(s->hwnd, s->autosave_timer_id);
+    s->autosave_timer_id = SetTimer(s->hwnd, 3, 3 * 60 * 1000, nullptr);
+  } else if (s->autosave_timer_id) {
+    KillTimer(s->hwnd, s->autosave_timer_id);
+    s->autosave_timer_id = 0;
+  }
 }
 
 static bool EditorHasMeaningfulContent(AppState* s) {
+  if (!s) return false;
+  return !EditorMatchesDefaultDraft(s);
+}
+
+static bool EditorMatchesDefaultDraft(AppState* s) {
+  if (!s) return true;
   std::wstring category = GetWindowTextWString(s->cb_category);
   std::wstring start_time = GetDateCtrlYmd(s->ed_start);
   std::wstring end_time = GetDateCtrlYmd(s->ed_end);
   std::wstring title = GetWindowTextWString(s->ed_title);
   std::wstring body = GetWindowTextWString(s->ed_body);
-
-  // If user hasn't typed anything besides category, don't nag on navigation.
-  bool has_any = !title.empty() || !body.empty() || !start_time.empty() || !end_time.empty() || !s->editor_materials_dir.empty();
-  (void)category;
-  return has_any;
+  std::wstring default_category = s->categories.empty() ? L"" : s->categories[0];
+  std::wstring default_start = FormatDateYYYYMMDD(s->selected);
+  std::wstring default_end = FormatDateYYYYMMDD(AddDays(s->selected, 1));
+  int status_sel = s->cb_status ? (int)SendMessageW(s->cb_status, CB_GETCURSEL, 0, 0) : 0;
+  return category == default_category &&
+         start_time == default_start &&
+         end_time == default_end &&
+         status_sel == 0 &&
+         title.empty() &&
+         body.empty() &&
+         s->editor_materials_dir.empty();
 }
 
 static bool EditorMatchesEntry(AppState* s, const Entry& e) {
@@ -1347,9 +2019,14 @@ static bool EditorMatchesEntry(AppState* s, const Entry& e) {
   cur.end_time = GetDateCtrlYmd(s->ed_end);
   cur.title = GetWindowTextWString(s->ed_title);
   cur.body_plain = GetWindowTextWString(s->ed_body);
+  if (s->ed_body && !cur.body_plain.empty()) {
+    std::string rtf = RichEditGetRtfBytes(s->ed_body);
+    if (!rtf.empty()) cur.body_rtf_b64 = Base64Encode(rtf);
+  }
   cur.materials_dir = s->editor_materials_dir;
   return cur.category == e.category && cur.start_time == e.start_time && cur.end_time == e.end_time &&
-         cur.title == e.title && cur.body_plain == e.body_plain && cur.materials_dir == e.materials_dir;
+         cur.title == e.title && cur.body_plain == e.body_plain && cur.body_rtf_b64 == e.body_rtf_b64 &&
+         cur.materials_dir == e.materials_dir;
 }
 
 static bool IsEditorTrulyDirty(AppState* s) {
@@ -1359,14 +2036,16 @@ static bool IsEditorTrulyDirty(AppState* s) {
 
   if (!s->editor_dirty && !body_modified) return false;
   if (s->editing_index >= 0 && s->editing_index < (int)s->day.entries.size()) {
-    if (body_modified) return true;
     return !EditorMatchesEntry(s, s->day.entries[(size_t)s->editing_index]);
   }
-  // For new entries, avoid nagging on empty content even if RichEdit modify flag was toggled.
-  return EditorHasMeaningfulContent(s);
+  // For new entries, avoid nagging when editor still matches the untouched default draft,
+  // even if RichEdit or date controls toggled internal modify state.
+  return !EditorMatchesDefaultDraft(s);
 }
 
 static void ClearEditor(AppState* s) {
+  if (!s) return;
+  s->suppress_editor_change_tracking = true;
   if (!s->categories.empty()) SetWindowTextW(s->cb_category, s->categories[0].c_str());
   else SetWindowTextW(s->cb_category, L"");
   DateTime_SetSystemtime(s->ed_start, GDT_VALID, &s->selected);
@@ -1382,18 +2061,21 @@ static void ClearEditor(AppState* s) {
   SetEditorDirty(s, false);
   EnableWindow(s->cb_category, TRUE);
   EnableWindow(s->ed_title, TRUE);
-  if (s->cb_status) EnableWindow(s->cb_status, FALSE);
+  if (s->cb_status) EnableWindow(s->cb_status, TRUE);
+  s->suppress_editor_change_tracking = false;
   UpdateStatusBar(s);
 }
 
 static void FillEditorFromEntry(AppState* s, const Entry& e, int index) {
+  if (!s) return;
+  s->suppress_editor_change_tracking = true;
   bool is_task = EntryIsTaskProgress(e);
   SetWindowTextW(s->cb_category, e.category.c_str());
   SetDateCtrlOrDefault(s->ed_start, e.start_time, s->selected);
   SetDateCtrlOrDefault(s->ed_end, e.end_time, AddDays(s->selected, 1));
   if (s->cb_status) {
     SendMessageW(s->cb_status, CB_SETCURSEL, ComboSelFromStatus(EffectiveStatus(s, e)), 0);
-    EnableWindow(s->cb_status, is_task ? TRUE : FALSE);
+    EnableWindow(s->cb_status, TRUE);
   }
   SetEditText(s->ed_title, e.title);
   if (!e.body_rtf_b64.empty()) {
@@ -1419,8 +2101,9 @@ static void FillEditorFromEntry(AppState* s, const Entry& e, int index) {
   if (s->ed_body) SendMessageW(s->ed_body, EM_SETMODIFY, FALSE, 0);
   s->editing_index = index;
   SetEditorDirty(s, false);
-  EnableWindow(s->cb_category, is_task ? FALSE : TRUE);
-  EnableWindow(s->ed_title, is_task ? FALSE : TRUE);
+  EnableWindow(s->cb_category, TRUE);
+  EnableWindow(s->ed_title, TRUE);
+  s->suppress_editor_change_tracking = false;
   UpdateStatusBar(s);
 }
 
@@ -1441,7 +2124,89 @@ static std::wstring EntryMaterialsDirText(AppState* s, const Entry& e) {
   return L"";
 }
 
+static int CompareTextNoCase(const std::wstring& a, const std::wstring& b) {
+  int r = _wcsicmp(a.c_str(), b.c_str());
+  if (r < 0) return -1;
+  if (r > 0) return 1;
+  return 0;
+}
+
+static int CompareEntryStartTime(const Entry& a, const Entry& b) {
+  bool a_empty = a.start_time.empty();
+  bool b_empty = b.start_time.empty();
+  if (a_empty != b_empty) return a_empty ? 1 : -1;
+  int r = CompareDateYmd(a.start_time, b.start_time);
+  if (r != 0) return r;
+  r = CompareDateYmd(a.end_time, b.end_time);
+  if (r != 0) return r;
+  r = CompareTextNoCase(a.title, b.title);
+  if (r != 0) return r;
+  return CompareTextNoCase(a.id, b.id);
+}
+
+static int CompareEntryCategory(const Entry& a, const Entry& b) {
+  int r = CompareTextNoCase(a.category, b.category);
+  if (r != 0) return r;
+  r = CompareEntryStartTime(a, b);
+  if (r != 0) return r;
+  return CompareTextNoCase(a.id, b.id);
+}
+
+static int CompareEntryStatus(AppState* s, const Entry& a, const Entry& b) {
+  int sa = (int)EffectiveStatus(s, a);
+  int sb = (int)EffectiveStatus(s, b);
+  if (sa != sb) return sa < sb ? -1 : 1;
+  int r = CompareEntryStartTime(a, b);
+  if (r != 0) return r;
+  return CompareTextNoCase(a.id, b.id);
+}
+
+static void SortDayEntries(AppState* s) {
+  if (!s) return;
+
+  std::wstring editing_id;
+  if (s->editing_index >= 0 && s->editing_index < (int)s->day.entries.size()) {
+    editing_id = s->day.entries[(size_t)s->editing_index].id;
+  }
+
+  auto cmp = [&](const Entry& a, const Entry& b) {
+    int r = 0;
+    switch (s->list_sort_column) {
+      case 1:
+        r = CompareEntryCategory(a, b);
+        break;
+      case 3:
+        r = CompareEntryStatus(s, a, b);
+        break;
+      case 0:
+      default:
+        r = CompareEntryStartTime(a, b);
+        break;
+    }
+    if (s->list_sort_desc) r = -r;
+    return r < 0;
+  };
+  std::stable_sort(s->day.entries.begin(), s->day.entries.end(), cmp);
+
+  if (!editing_id.empty()) {
+    for (int i = 0; i < (int)s->day.entries.size(); i++) {
+      if (s->day.entries[(size_t)i].id == editing_id) {
+        s->editing_index = i;
+        break;
+      }
+    }
+  }
+}
+
 static void RefreshList(AppState* s) {
+  int prev_sel = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
+  std::wstring prev_id;
+  if (prev_sel >= 0 && prev_sel < (int)s->day.entries.size()) {
+    prev_id = s->day.entries[(size_t)prev_sel].id;
+  }
+
+  SortDayEntries(s);
+
   ListView_DeleteAllItems(s->list);
 
   for (int i = 0; i < (int)s->day.entries.size(); i++) {
@@ -1460,6 +2225,22 @@ static void RefreshList(AppState* s) {
     ListView_SetItemText(s->list, i, 3, const_cast<wchar_t*>(StatusToCN(st)));
     std::wstring dir = EntryMaterialsDirText(s, e);
     ListView_SetItemText(s->list, i, 4, const_cast<wchar_t*>(dir.c_str()));
+  }
+
+  int restore_index = -1;
+  if (!prev_id.empty()) {
+    for (int i = 0; i < (int)s->day.entries.size(); i++) {
+      if (s->day.entries[(size_t)i].id == prev_id) {
+        restore_index = i;
+        break;
+      }
+    }
+  } else if (prev_sel >= 0 && prev_sel < (int)s->day.entries.size()) {
+    restore_index = prev_sel;
+  }
+  if (restore_index >= 0) {
+    ListView_SetItemState(s->list, restore_index, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    ListView_EnsureVisible(s->list, restore_index, FALSE);
   }
 
   UpdateDayHeader(s);
@@ -1551,20 +2332,32 @@ static bool SaveEditorToModel(AppState* s, bool* out_changed) {
     }
   }
 
-  // Status (only meaningful for long-term tasks). We treat it as a property of the Task itself.
+  // Status: normal entries store it directly; task progress keeps using the underlying task status.
   bool task_status_changed = false;
+  bool task_meta_changed = false;
   if (EntryIsTaskProgress(e) && s->cb_status) {
     int idx = (int)SendMessageW(s->cb_status, CB_GETCURSEL, 0, 0);
     EntryStatus chosen = StatusFromComboSel(idx);
     Task* t = FindTaskById(s, e.task_id);
-    if (t && t->status != chosen) {
-      t->status = chosen;
-      task_status_changed = true;
+    if (t) {
+      if (t->status != chosen) {
+        t->status = chosen;
+        task_status_changed = true;
+      }
+      if (t->category != e.category) {
+        t->category = e.category;
+        task_meta_changed = true;
+      }
+      if (t->title != e.title) {
+        t->title = e.title;
+        task_meta_changed = true;
+      }
     }
     // Keep per-day entry status empty; list uses EffectiveStatus(task.status) when entry.status == None.
     e.status = EntryStatus::None;
   } else {
-    e.status = EntryStatus::None;
+    int idx = s->cb_status ? (int)SendMessageW(s->cb_status, CB_GETCURSEL, 0, 0) : 0;
+    e.status = StatusFromComboSel(idx);
   }
 
   // Materials dir: for task progress it is treated as a property of the Task, not the per-day entry.
@@ -1604,12 +2397,12 @@ static bool SaveEditorToModel(AppState* s, bool* out_changed) {
   if (EntryIsTaskProgress(e)) {
     has_any = !e.body_plain.empty() || !e.start_time.empty() || !e.end_time.empty();
   } else {
-    has_any = !e.title.empty() || !e.body_plain.empty() || !e.start_time.empty() || !e.end_time.empty() || !e.materials_dir.empty();
+    has_any = !e.title.empty() || !e.body_plain.empty() || e.status != EntryStatus::None || !e.materials_dir.empty();
   }
   if (!has_any) {
     // Treat as "nothing to save": allow navigation without blocking.
-    if (out_changed) *out_changed = task_status_changed;
-    if (task_status_changed) {
+    if (out_changed) *out_changed = task_status_changed || task_meta_changed;
+    if (task_status_changed || task_meta_changed) {
       std::wstring terr;
       SaveTasks(s->tasks, &terr);
       RefreshList(s);
@@ -1647,7 +2440,7 @@ static bool SaveEditorToModel(AppState* s, bool* out_changed) {
     SaveCategories(s->categories, &cat_err);
   }
 
-  if (task_status_changed) {
+  if (task_status_changed || task_meta_changed) {
     std::wstring terr;
     SaveTasks(s->tasks, &terr);
     RefreshList(s);
@@ -1697,16 +2490,28 @@ static bool SaveCurrent(AppState* s) {
     ListView_SetItemState(s->list, s->editing_index, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
     ListView_EnsureVisible(s->list, s->editing_index, FALSE);
   }
+  SetFocus(s->ed_body ? s->ed_body : s->ed_title);
+  ShowToast(s, L"已保存");
   UpdateStatusBar(s);
   return true;
 }
 
 static void DeleteCurrent(AppState* s) {
-  if (s->editing_index < 0 || s->editing_index >= (int)s->day.entries.size()) return;
-  int idx = s->editing_index;
-  s->day.entries.erase(s->day.entries.begin() + idx);
+  if (!s) return;
+  std::vector<int> selected = GetSelectedEntryIndices(s);
+  if (selected.empty()) {
+    if (s->editing_index >= 0 && s->editing_index < (int)s->day.entries.size()) selected.push_back(s->editing_index);
+  }
+  if (selected.empty()) return;
 
-  // Save after delete.
+  std::sort(selected.begin(), selected.end());
+  selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
+  int next_idx = selected.front();
+
+  for (auto it = selected.rbegin(); it != selected.rend(); ++it) {
+    s->day.entries.erase(s->day.entries.begin() + *it);
+  }
+
   std::wstring err;
   if (!s->day.entries.empty()) {
     if (!SaveDayFile(s->day, &err)) {
@@ -1719,7 +2524,19 @@ static void DeleteCurrent(AppState* s) {
   }
 
   RefreshList(s);
-  ClearEditor(s);
+  if (!s->day.entries.empty()) {
+    if (next_idx >= (int)s->day.entries.size()) next_idx = (int)s->day.entries.size() - 1;
+    s->editing_index = next_idx;
+    ListView_SetItemState(s->list, next_idx, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    ListView_EnsureVisible(s->list, next_idx, FALSE);
+    FillEditorFromEntry(s, s->day.entries[(size_t)next_idx], next_idx);
+    SetFocus(s->ed_body ? s->ed_body : s->ed_title);
+  } else {
+    ClearEditor(s);
+    HWND h = GetComboEditHandle(s->cb_category);
+    SetFocus(h ? h : s->cb_category);
+  }
+  ShowToast(s, selected.size() > 1 ? L"已删除选中条目" : L"已删除条目");
 }
 
 static void DiscardEditorChanges(AppState* s) {
@@ -1740,13 +2557,14 @@ static void DiscardEditorChanges(AppState* s) {
 static bool PromptSaveIfDirty(AppState* s) {
   if (s && s->suppress_dirty_prompt) return true;
   if (!IsEditorTrulyDirty(s)) return true;
-  int r = MessageBoxW(s->hwnd, L"当前编辑尚未保存。是否保存？", kAppTitle, MB_YESNOCANCEL | MB_ICONWARNING);
-  if (r == IDCANCEL) return false;
-  if (r == IDNO) {
+  if (s && !EditorHasMeaningfulContent(s)) {
     DiscardEditorChanges(s);
     return true;
   }
-  return SaveCurrent(s);
+  if (s) {
+    return SaveCurrent(s);
+  }
+  return true;
 }
 
 static bool WriteUtf8File(const std::wstring& path, const std::wstring& content, std::wstring* err) {
@@ -1829,482 +2647,6 @@ static bool ParseKVLine(const std::wstring& line, std::wstring* out_k, std::wstr
   if (out_k) *out_k = line.substr(0, eq);
   if (out_v) *out_v = line.substr(eq + 1);
   return true;
-}
-
-struct AuthSettings {
-  // configured: whether auth.wla exists and was successfully parsed.
-  // enabled: whether password prompt is required on startup.
-  bool configured{false};
-  bool enabled{false};
-  int iters{80000};
-  std::string salt;  // raw bytes
-  std::string hash;  // raw bytes
-};
-
-static std::wstring GetAuthFilePath() {
-  return JoinPath(GetDataRootDir(), L"auth.wla");
-}
-
-static bool AuthLoad(AuthSettings* out, std::wstring* err) {
-  if (!out) return false;
-  *out = AuthSettings{};
-
-  std::wstring path = GetAuthFilePath();
-  if (!FileExists(path)) return true;  // not configured yet
-
-  std::wstring content;
-  if (!ReadFileUtf8Simple(path, &content, err)) return false;
-
-  std::wstringstream ss(content);
-  std::wstring line;
-  bool header_ok = false;
-  int version = 0;
-  std::wstring enabled_w, salt_b64, hash_b64, iters_w;
-  while (std::getline(ss, line)) {
-    if (!line.empty() && line.back() == L'\r') line.pop_back();
-    if (line.empty()) continue;
-    if (!header_ok) {
-      if (line == L"WLA1") { header_ok = true; version = 1; }
-      else if (line == L"WLA2") { header_ok = true; version = 2; }
-      continue;
-    }
-    std::wstring k, v;
-    if (!ParseKVLine(line, &k, &v)) continue;
-    if (k == L"enabled") enabled_w = v;
-    else if (k == L"iters") iters_w = v;
-    else if (k == L"salt_b64") salt_b64 = v;
-    else if (k == L"hash_b64") hash_b64 = v;
-  }
-  if (!header_ok) {
-    if (err) *err = L"密码文件格式错误: " + path;
-    return false;
-  }
-
-  out->configured = true;
-
-  // WLA2 supports explicit disable: enabled=0 means "skip password prompt on startup".
-  if (version >= 2) {
-    int enabled_i = _wtoi(enabled_w.c_str());
-    if (enabled_i == 0) {
-      out->enabled = false;
-      out->iters = 0;
-      out->salt.clear();
-      out->hash.clear();
-      return true;
-    }
-  }
-
-  int iters = _wtoi(iters_w.c_str());
-  if (iters <= 1000) iters = 80000;
-
-  std::string salt_bytes;
-  std::string hash_bytes;
-  if (!Base64Decode(WideToUtf8(salt_b64), &salt_bytes) || salt_bytes.empty()) {
-    if (err) *err = L"密码文件损坏(salt): " + path;
-    return false;
-  }
-  if (!Base64Decode(WideToUtf8(hash_b64), &hash_bytes) || hash_bytes.empty()) {
-    if (err) *err = L"密码文件损坏(hash): " + path;
-    return false;
-  }
-
-  out->enabled = true;
-  out->iters = iters;
-  out->salt = std::move(salt_bytes);
-  out->hash = std::move(hash_bytes);
-  return true;
-}
-
-static bool AuthSave(const AuthSettings& s, std::wstring* err) {
-  EnsureDirExists(GetDataRootDir());
-  std::wstring path = GetAuthFilePath();
-
-  std::wstring content;
-  // WLA2: explicit enabled flag for "disable password login".
-  content += L"WLA2\n";
-  content += L"enabled=" + std::to_wstring(s.enabled ? 1 : 0) + L"\n";
-  content += L"iters=" + std::to_wstring(s.iters) + L"\n";
-  content += L"salt_b64=" + Utf8ToWide(Base64Encode(s.salt)) + L"\n";
-  content += L"hash_b64=" + Utf8ToWide(Base64Encode(s.hash)) + L"\n";
-  return WriteUtf8File(path, content, err);
-}
-
-static bool DerivePbkdf2Sha256(const std::string& password_utf8,
-                               const std::string& salt,
-                               int iters,
-                               std::string* out_key,
-                               std::wstring* err) {
-  if (!out_key) return false;
-  out_key->clear();
-  if (iters < 1000) iters = 1000;
-
-  BCRYPT_ALG_HANDLE hAlg = nullptr;
-  // BCryptDeriveKeyPBKDF2 expects an HMAC-capable algorithm handle (PRF).
-  NTSTATUS st = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
-  if (st != 0 || !hAlg) {
-    if (err) *err = L"无法初始化加密模块(BCryptOpenAlgorithmProvider)";
-    return false;
-  }
-  std::string key;
-  key.resize(32);
-  st = BCryptDeriveKeyPBKDF2(hAlg,
-                             (PUCHAR)password_utf8.data(), (ULONG)password_utf8.size(),
-                             (PUCHAR)salt.data(), (ULONG)salt.size(),
-                             (ULONGLONG)iters,
-                             (PUCHAR)key.data(), (ULONG)key.size(),
-                             0);
-  BCryptCloseAlgorithmProvider(hAlg, 0);
-  if (st != 0) {
-    if (err) *err = L"密码派生失败(BCryptDeriveKeyPBKDF2)";
-    return false;
-  }
-  *out_key = std::move(key);
-  return true;
-}
-
-static bool SecureEq(const std::string& a, const std::string& b) {
-  if (a.size() != b.size()) return false;
-  unsigned char x = 0;
-  for (size_t i = 0; i < a.size(); i++) x |= (unsigned char)(a[i] ^ b[i]);
-  return x == 0;
-}
-
-static bool AuthVerifyPassword(const AuthSettings& s, const std::wstring& password, std::wstring* err) {
-  if (!s.enabled) return true;
-  std::string pass = WideToUtf8(password);
-  std::string key;
-  if (!DerivePbkdf2Sha256(pass, s.salt, s.iters, &key, err)) return false;
-  if (!SecureEq(key, s.hash)) return false;
-  return true;
-}
-
-static bool AuthSetNewPassword(const std::wstring& new_password, std::wstring* err) {
-  AuthSettings s{};
-  s.configured = true;
-  s.enabled = true;
-  s.iters = 80000;
-
-  // 16-byte random salt.
-  std::string salt;
-  salt.resize(16);
-  NTSTATUS st = BCryptGenRandom(nullptr, (PUCHAR)salt.data(), (ULONG)salt.size(), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-  if (st != 0) {
-    if (err) *err = L"无法生成随机盐(BCryptGenRandom)";
-    return false;
-  }
-  s.salt = std::move(salt);
-
-  std::string key;
-  if (!DerivePbkdf2Sha256(WideToUtf8(new_password), s.salt, s.iters, &key, err)) return false;
-  s.hash = std::move(key);
-  return AuthSave(s, err);
-}
-
-static bool AuthDisablePasswordLogin(std::wstring* err) {
-  AuthSettings s{};
-  s.configured = true;
-  s.enabled = false;
-  s.iters = 0;
-  s.salt.clear();
-  s.hash.clear();
-  return AuthSave(s, err);
-}
-
-struct PasswordWindowState {
-  HWND hwnd{};
-  HWND st_info{};
-  HWND st_p1{};
-  HWND st_p2{};
-  HWND ed_p1{};
-  HWND ed_p2{};
-  HWND btn_ok{};
-  HWND btn_cancel{};
-  HFONT font{};
-  bool is_setup{false};
-  bool ok{false};
-  std::wstring out_password;
-};
-
-static std::wstring GetEditText(HWND h) {
-  return GetWindowTextWString(h);
-}
-
-static void PwSetFocusAll(HWND h) {
-  SetFocus(h);
-  SendMessageW(h, EM_SETSEL, 0, -1);
-}
-
-static LRESULT CALLBACK PasswordWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-  auto* s = reinterpret_cast<PasswordWindowState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-  switch (msg) {
-    case WM_CREATE: {
-      auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
-      s = reinterpret_cast<PasswordWindowState*>(cs->lpCreateParams);
-      s->hwnd = hwnd;
-      SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(s));
-      s->font = CreateUiFont(hwnd);
-
-      s->st_info = CreateWindowExW(0, L"STATIC", s->is_setup ? L"首次使用：请设置密码(至少 6 位)。" : L"请输入密码：",
-                                   WS_CHILD | WS_VISIBLE,
-                                   0, 0, 10, 10, hwnd, (HMENU)1, nullptr, nullptr);
-      s->st_p1 = CreateWindowExW(0, L"STATIC", s->is_setup ? L"新密码" : L"密码",
-                                 WS_CHILD | WS_VISIBLE,
-                                 0, 0, 10, 10, hwnd, (HMENU)2, nullptr, nullptr);
-      s->ed_p1 = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                                 WS_CHILD | WS_VISIBLE | ES_PASSWORD | ES_AUTOHSCROLL | WS_TABSTOP,
-                                 0, 0, 10, 10, hwnd, (HMENU)3, nullptr, nullptr);
-
-      s->st_p2 = CreateWindowExW(0, L"STATIC", L"确认密码",
-                                 WS_CHILD | (s->is_setup ? WS_VISIBLE : 0),
-                                 0, 0, 10, 10, hwnd, (HMENU)4, nullptr, nullptr);
-      s->ed_p2 = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                                 WS_CHILD | (s->is_setup ? WS_VISIBLE : 0) | ES_PASSWORD | ES_AUTOHSCROLL | WS_TABSTOP,
-                                 0, 0, 10, 10, hwnd, (HMENU)5, nullptr, nullptr);
-
-      s->btn_ok = CreateWindowExW(0, L"BUTTON", L"确定",
-                                  WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP,
-                                  0, 0, 10, 10, hwnd, (HMENU)6, nullptr, nullptr);
-      s->btn_cancel = CreateWindowExW(0, L"BUTTON", L"取消",
-                                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                                      0, 0, 10, 10, hwnd, (HMENU)7, nullptr, nullptr);
-
-      for (HWND h : {s->st_info, s->st_p1, s->st_p2, s->ed_p1, s->ed_p2, s->btn_ok, s->btn_cancel}) {
-        if (!h) continue;
-        SetControlFont(h, s->font);
-      }
-      SetFocus(s->ed_p1);
-      return 0;
-    }
-    case WM_SIZE: {
-      int w = LOWORD(lParam);
-      int h = HIWORD(lParam);
-      int pad = ScalePx(hwnd, 12);
-      int row = ScalePx(hwnd, 26);
-      int lbl = ScalePx(hwnd, 18);
-      int btn_h = ScalePx(hwnd, 30);
-      int btn_w = ScalePx(hwnd, 90);
-
-      int x = pad;
-      int y = pad;
-      MoveWindow(s->st_info, x, y, w - 2 * pad, lbl, TRUE);
-      y += lbl + pad;
-
-      MoveWindow(s->st_p1, x, y, w - 2 * pad, lbl, TRUE);
-      y += lbl + ScalePx(hwnd, 2);
-      MoveWindow(s->ed_p1, x, y, w - 2 * pad, row, TRUE);
-      y += row + pad;
-
-      if (s->is_setup) {
-        ShowWindow(s->st_p2, SW_SHOW);
-        ShowWindow(s->ed_p2, SW_SHOW);
-        MoveWindow(s->st_p2, x, y, w - 2 * pad, lbl, TRUE);
-        y += lbl + ScalePx(hwnd, 2);
-        MoveWindow(s->ed_p2, x, y, w - 2 * pad, row, TRUE);
-        y += row + pad;
-      } else {
-        ShowWindow(s->st_p2, SW_HIDE);
-        ShowWindow(s->ed_p2, SW_HIDE);
-      }
-
-      int y_btn = h - pad - btn_h;
-      MoveWindow(s->btn_cancel, w - pad - btn_w, y_btn, btn_w, btn_h, TRUE);
-      MoveWindow(s->btn_ok, w - pad * 2 - btn_w * 2, y_btn, btn_w, btn_h, TRUE);
-      return 0;
-    }
-    case WM_COMMAND: {
-      int id = LOWORD(wParam);
-      if (id == 6) {  // OK
-        std::wstring p1 = GetEditText(s->ed_p1);
-        std::wstring p2 = s->is_setup ? GetEditText(s->ed_p2) : p1;
-        if ((int)p1.size() < 6) {
-          ShowInfoBox(hwnd, L"密码至少 6 位。", L"提示");
-          PwSetFocusAll(s->ed_p1);
-          return 0;
-        }
-        if (s->is_setup && p1 != p2) {
-          ShowInfoBox(hwnd, L"两次密码不一致。", L"提示");
-          PwSetFocusAll(s->ed_p2);
-          return 0;
-        }
-        s->out_password = p1;
-        s->ok = true;
-        DestroyWindow(hwnd);
-        return 0;
-      }
-      if (id == 7) {  // Cancel
-        DestroyWindow(hwnd);
-        return 0;
-      }
-      return 0;
-    }
-    case WM_CLOSE: {
-      DestroyWindow(hwnd);
-      return 0;
-    }
-    case WM_DESTROY: {
-      if (s && s->font) DeleteObject(s->font);
-      return 0;
-    }
-  }
-  return DefWindowProcW(hwnd, msg, wParam, lParam);
-}
-
-static bool PromptPassword(HWND owner, bool is_setup, std::wstring* out_password) {
-  WNDCLASSW wc{};
-  wc.lpfnWndProc = PasswordWndProc;
-  wc.hInstance = GetModuleHandleW(nullptr);
-  wc.lpszClassName = L"WorkLogLitePasswordWnd";
-  wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-  wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-  RegisterClassW(&wc);
-
-  PasswordWindowState state{};
-  state.is_setup = is_setup;
-
-  HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, wc.lpszClassName, is_setup ? L"设置密码" : L"输入密码",
-                              WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 520, is_setup ? 320 : 260,
-                              owner, nullptr, wc.hInstance, &state);
-  if (!hwnd) return false;
-
-  EnableWindow(owner, FALSE);
-  while (IsWindow(hwnd)) {
-    MSG msg{};
-    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-      if (msg.message == WM_QUIT) {
-        PostQuitMessage((int)msg.wParam);
-        EnableWindow(owner, TRUE);
-        return false;
-      }
-      TranslateMessage(&msg);
-      DispatchMessageW(&msg);
-    }
-    WaitMessage();
-  }
-  EnableWindow(owner, TRUE);
-  SetForegroundWindow(owner);
-
-  if (state.ok && out_password) *out_password = state.out_password;
-  return state.ok;
-}
-
-static bool EnsureAuthenticated(HWND owner) {
-  std::wstring err;
-  AuthSettings s{};
-  if (!AuthLoad(&s, &err)) {
-    ShowInfoBox(owner, err.c_str(), L"读取密码失败");
-    return false;
-  }
-
-  // Not configured yet: first run, require setting a password by default.
-  if (!s.configured) {
-    std::wstring pw;
-    if (!PromptPassword(owner, true, &pw)) return false;
-    std::wstring serr;
-    if (!AuthSetNewPassword(pw, &serr)) {
-      ShowInfoBox(owner, serr.c_str(), L"设置失败");
-      return false;
-    }
-    ShowInfoBox(owner, L"密码已设置。下次启动需要输入密码。", L"提示");
-    return true;
-  }
-
-  // Explicitly disabled: skip login prompt entirely.
-  if (!s.enabled) return true;
-
-  for (;;) {
-    std::wstring pw;
-    if (!PromptPassword(owner, false, &pw)) return false;
-    std::wstring verr;
-    bool ok = AuthVerifyPassword(s, pw, &verr);
-    if (!verr.empty() && !ok) {
-      ShowInfoBox(owner, verr.c_str(), L"验证失败");
-      continue;
-    }
-    if (ok) return true;
-    ShowInfoBox(owner, L"密码错误。", L"提示");
-  }
-}
-
-static void ChangePasswordFlow(HWND owner) {
-  std::wstring err;
-  AuthSettings s{};
-  if (!AuthLoad(&s, &err)) {
-    ShowInfoBox(owner, err.c_str(), L"读取密码失败");
-    return;
-  }
-  if (!s.enabled) {
-    ShowInfoBox(owner, L"当前未设置密码，将直接进入设置流程。", L"提示");
-  } else {
-    for (;;) {
-      std::wstring cur;
-      if (!PromptPassword(owner, false, &cur)) return;
-      std::wstring verr;
-      bool ok = AuthVerifyPassword(s, cur, &verr);
-      if (!verr.empty() && !ok) {
-        ShowInfoBox(owner, verr.c_str(), L"验证失败");
-        continue;
-      }
-      if (ok) break;
-      ShowInfoBox(owner, L"当前密码错误。", L"提示");
-    }
-  }
-
-  std::wstring npw;
-  if (!PromptPassword(owner, true, &npw)) return;
-  std::wstring serr;
-  if (!AuthSetNewPassword(npw, &serr)) {
-    ShowInfoBox(owner, serr.c_str(), L"修改失败");
-    return;
-  }
-  ShowInfoBox(owner, L"密码已修改。", L"提示");
-}
-
-static void DisablePasswordLoginFlow(HWND owner) {
-  std::wstring err;
-  AuthSettings s{};
-  if (!AuthLoad(&s, &err)) {
-    ShowInfoBox(owner, err.c_str(), L"读取密码失败");
-    return;
-  }
-
-  if (!s.configured) {
-    ShowInfoBox(owner, L"当前尚未设置密码，不需要取消密码登录。", L"提示");
-    return;
-  }
-  if (!s.enabled) {
-    ShowInfoBox(owner, L"当前已取消密码登录。", L"提示");
-    return;
-  }
-
-  // Security: require current password before allowing disabling login gate.
-  for (;;) {
-    std::wstring pw;
-    if (!PromptPassword(owner, false, &pw)) return;
-    std::wstring verr;
-    bool ok = AuthVerifyPassword(s, pw, &verr);
-    if (!verr.empty() && !ok) {
-      ShowInfoBox(owner, verr.c_str(), L"验证失败");
-      continue;
-    }
-    if (ok) break;
-    ShowInfoBox(owner, L"密码错误。", L"提示");
-  }
-
-  int r = MessageBoxW(owner,
-                      L"即将取消密码登录。\n\n"
-                      L"- 下次启动将不再要求输入密码\n"
-                      L"- 注意：这不会加密数据文件，取消后任何能访问本机文件的人都能直接读取 data 目录\n\n"
-                      L"确定继续？",
-                      kAppTitle, MB_YESNO | MB_ICONWARNING);
-  if (r != IDYES) return;
-
-  std::wstring serr;
-  if (!AuthDisablePasswordLogin(&serr)) {
-    ShowInfoBox(owner, serr.c_str(), L"取消失败");
-    return;
-  }
-  ShowInfoBox(owner, L"已取消密码登录。\n如需重新启用，可通过“工具 -> 修改密码...”重新设置密码。", L"完成");
 }
 
 static bool CopyToClipboard(HWND hwnd, const std::wstring& text) {
@@ -2695,12 +3037,24 @@ static bool MoveDir(const std::wstring& from, const std::wstring& to, std::wstri
   return false;
 }
 
+static void ReloadAppDataAfterFilesystemChange(AppState* s) {
+  if (!s) return;
+  {
+    std::wstring cat_err;
+    LoadCategories(&s->categories, &cat_err);
+    NormalizeCategories(&s->categories);
+    RefreshCategoryCombo(s);
+  }
+  {
+    std::wstring terr;
+    LoadTasks(&s->tasks, &terr);
+  }
+  LoadSelectedDay(s, s->selected);
+}
+
 static void ExportFullData(AppState* s) {
   std::wstring pick;
   if (!PickFolderDialog(s->hwnd, L"选择导出到的文件夹", &pick)) return;
-
-  std::wstring src = GetDataRootDir();
-  std::wstring dst = JoinPathLoose(pick, L"WorkLogLite-export-" + NowTimestampCompact());
 
   if (IsUncPath(pick)) {
     int r = MessageBoxW(s->hwnd,
@@ -2710,18 +3064,15 @@ static void ExportFullData(AppState* s) {
                         kAppTitle, MB_YESNO | MB_ICONWARNING);
     if (r != IDYES) return;
   }
-  if (IsSameOrChildDir(src, dst)) {
-    ShowInfoBox(s->hwnd, L"导出目标不能位于当前数据目录内部，否则会导致递归拷贝。\n\n请换一个导出目录。", L"导出失败");
-    return;
-  }
 
+  std::wstring export_dir;
   std::wstring err;
-  if (!CopyDirRecursive(src, dst, &err)) {
+  if (!ExportWorkLogLiteData(GetDataRootDir(), pick, &export_dir, &err)) {
     ShowInfoBox(s->hwnd, err.c_str(), L"导出失败");
     return;
   }
 
-  std::wstring done = L"已导出到：\n" + dst + L"\n\n说明：这是完整数据目录的原样拷贝（包含日数据、分类、长期任务、密码设置等）。";
+  std::wstring done = L"已导出到：\n" + export_dir + L"\n\n说明：这是完整数据目录的原样拷贝（包含日数据、分类、长期任务和兼容文件等）。";
   ShowInfoBox(s->hwnd, done.c_str(), L"导出完成");
 }
 
@@ -2731,9 +3082,9 @@ static void ImportFullData(AppState* s) {
   std::wstring pick;
   if (!PickFolderDialog(s->hwnd, L"选择要导入的数据文件夹", &pick)) return;
 
-  std::wstring src_root = ResolveImportDataRoot(pick);
-  if (src_root.empty()) {
-    ShowInfoBox(s->hwnd, L"所选文件夹看起来不像 WorkLogLite 的数据目录。\n\n请选中：包含 categories.txt / tasks.wlt / auth.wla 或 YYYY\\MM\\YYYY-MM-DD.wlr 的目录。\n\n也支持选择包含 data 子目录的外层文件夹。", L"导入失败");
+  std::wstring src_root;
+  if (!ResolveWorkLogLiteImportRoot(pick, &src_root)) {
+    ShowInfoBox(s->hwnd, L"所选文件夹看起来不像 WorkLogLite 的数据目录。\n\n请选中：包含 categories.txt / tasks.wlt / YYYY\\MM\\YYYY-MM-DD.wlr 的目录。\n\n也支持选择包含 data 子目录的外层文件夹。", L"导入失败");
     return;
   }
 
@@ -2755,61 +3106,27 @@ static void ImportFullData(AppState* s) {
   int r = MessageBoxW(s->hwnd,
                       L"即将用所选目录的数据“替换”当前数据目录。\n\n"
                       L"- 会覆盖你当前的所有数据文件\n"
-                      L"- 会覆盖密码设置(auth.wla)，下次启动可能需要输入导入数据对应的密码\n"
+                      L"- 会覆盖同名数据文件，包括旧版本留下的 auth.wla\n"
                       L"- 程序会自动创建一个备份目录\n\n"
                       L"确定继续导入吗？",
                       kAppTitle, MB_YESNO | MB_ICONWARNING);
   if (r != IDYES) return;
 
-  std::wstring parent = ParentDirOf(dst_root);
-  if (parent.empty()) {
-    ShowInfoBox(s->hwnd, L"无法确定数据目录的父目录，导入已取消。", L"导入失败");
-    return;
-  }
-
-  std::wstring stamp = NowTimestampCompact();
-  std::wstring tmp = JoinPathLoose(parent, L"WorkLogLite-data-tmp-" + stamp);
-  std::wstring backup = JoinPathLoose(parent, L"WorkLogLite-data-backup-" + stamp);
-
+  std::wstring backup;
   std::wstring err;
-  if (!CopyDirRecursive(src_root, tmp, &err)) {
-    ShowInfoBox(s->hwnd, err.c_str(), L"导入失败(复制阶段)");
+  if (!ImportWorkLogLiteData(pick, dst_root, &backup, &err)) {
+    ShowInfoBox(s->hwnd, err.c_str(), L"导入失败");
     return;
   }
 
-  // Swap: data -> backup, tmp -> data. This avoids partial overwrites and keeps a rollback path.
-  if (DirExistsW(dst_root)) {
-    if (!MoveDirReplace(dst_root, backup, &err)) {
-      ShowInfoBox(s->hwnd, err.c_str(), L"导入失败(备份阶段)");
-      return;
-    }
-  } else {
-    EnsureDirExists(dst_root);
-  }
+  ReloadAppDataAfterFilesystemChange(s);
 
-  if (!MoveDirReplace(tmp, dst_root, &err)) {
-    // Best-effort rollback.
-    std::wstring rollback_err;
-    MoveDirReplace(backup, dst_root, &rollback_err);
-    ShowInfoBox(s->hwnd, err.c_str(), L"导入失败(切换阶段)");
-    return;
+  std::wstring done = L"导入完成。\n\n当前数据目录已替换。";
+  if (!backup.empty()) {
+    done += L"\n备份目录：\n" + backup;
   }
-
-  // Reload caches and refresh UI.
-  {
-    std::wstring cat_err;
-    LoadCategories(&s->categories, &cat_err);
-    NormalizeCategories(&s->categories);
-    RefreshCategoryCombo(s);
-  }
-  {
-    std::wstring terr;
-    LoadTasks(&s->tasks, &terr);
-  }
-  LoadSelectedDay(s, s->selected);
-
-  std::wstring done = L"导入完成。\n\n当前数据目录已替换。\n备份目录：\n" + backup +
-                      L"\n\n提示：如果导入的数据包含 auth.wla，下一次启动会按导入数据的密码要求进行验证。";
+  done +=
+                      L"\n\n提示：如果导入的数据包含旧版本的 auth.wla，它会作为兼容文件一并保留，但当前版本不会启用密码验证。";
   ShowInfoBox(s->hwnd, done.c_str(), L"导入完成");
 }
 
@@ -2817,17 +3134,7 @@ static void ClearAllData(AppState* s) {
   if (!PromptSaveIfDirty(s)) return;
 
   std::wstring root = GetDataRootDir();
-  std::wstring parent = ParentDirOf(root);
-  if (parent.empty()) {
-    ShowInfoBox(s->hwnd, L"无法确定数据目录的父目录，清空已取消。", L"清空失败");
-    return;
-  }
-
-  // Ensure root exists so the backup move is predictable.
-  EnsureDirExists(root);
-
-  std::wstring stamp = NowTimestampCompact();
-  std::wstring backup = JoinPathLoose(parent, L"WorkLogLite-data-cleared-" + stamp);
+  std::wstring backup;
 
   std::wstring msg1 =
       L"即将清空本机所有 WorkLogLite 数据(重置)。\n\n"
@@ -2835,9 +3142,9 @@ static void ClearAllData(AppState* s) {
       L"- 所有日记录(.wlr)\n"
       L"- 分类(categories.txt)\n"
       L"- 长期任务(tasks.wlt)\n"
-      L"- 密码设置(auth.wla)\n\n"
+      L"- 旧版本兼容文件(auth.wla)\n\n"
       L"当前数据目录：\n" + root + L"\n\n"
-      L"程序会先把整个目录移动到备份目录(可回滚)：\n" + backup + L"\n\n"
+      L"程序会先备份整个目录，再重建一个干净的数据目录。\n\n"
       L"确定继续？";
   int r1 = MessageBoxW(s->hwnd, msg1.c_str(), kAppTitle, MB_YESNO | MB_ICONWARNING);
   if (r1 != IDYES) return;
@@ -2847,32 +3154,17 @@ static void ClearAllData(AppState* s) {
   if (r2 != IDYES) return;
 
   std::wstring err;
-  if (!MoveDir(root, backup, &err)) {
-    ShowInfoBox(s->hwnd, err.c_str(), L"清空失败(备份阶段)");
+  if (!ClearWorkLogLiteData(root, &backup, &err)) {
+    ShowInfoBox(s->hwnd, err.c_str(), L"清空失败");
     return;
   }
 
-  // Create a brand new empty root.
-  if (!EnsureDirExists(root)) {
-    ShowInfoBox(s->hwnd, (L"无法创建新的数据目录：\n" + root).c_str(), L"清空失败");
-    return;
-  }
-
-  // Reload caches and refresh UI (will recreate default categories file on first load).
-  {
-    std::wstring cat_err;
-    LoadCategories(&s->categories, &cat_err);
-    NormalizeCategories(&s->categories);
-    RefreshCategoryCombo(s);
-  }
-  s->tasks.clear();
-
-  LoadSelectedDay(s, s->selected);
+  ReloadAppDataAfterFilesystemChange(s);
 
   std::wstring done =
       L"已清空数据并完成重置。\n\n"
       L"备份目录：\n" + backup + L"\n\n"
-      L"提示：下次启动会要求重新设置密码(因为 auth.wla 已清空)。";
+      L"提示：清空后会重新建立一个干净的数据目录。";
   ShowInfoBox(s->hwnd, done.c_str(), L"清空完成");
 }
 
@@ -3572,6 +3864,7 @@ static void ShowHelp(AppState* s) {
       L"- 标题: 建议填写，用于列表和汇总更好看。\n"
       L"- 内容: 富文本(支持段落/对齐/缩进/编号/项目符号)。\n"
       L"  在正文框内: Ctrl+B 加粗, Ctrl+I 斜体, Ctrl+U 下划线。\n"
+      L"  可直接输入 Markdown 后点 MD，或按 Ctrl+Shift+M 应用样式。\n"
       L"  列表: Ctrl+Shift+7 编号, Ctrl+Shift+8 项目符号。\n"
       L"  段落: Ctrl+Alt+L 左对齐, Ctrl+Alt+E 居中, Ctrl+Alt+R 右对齐。\n"
       L"\n"
@@ -3580,10 +3873,8 @@ static void ShowHelp(AppState* s) {
       L"- 列表选中一条: 右侧进入编辑。\n"
       L"- 查看 -> 预览: 查看 Markdown 渲染效果。\n"
       L"- 报告 -> 导出 CSV: 直接导出本季度/本年度 CSV，方便 Excel/脚本处理。\n"
-      L"- 长期任务: 工具 -> 管理长期任务。任务会在其日期范围内每天自动出现在列表中，方便写进展。\n"
-      L"- 从会议创建任务: 在会议条目上右键 -> 从此会议创建长期任务。\n"
       L"- 演示数据: 工具 -> 生成示例数据(演示)。\n"
-      L"- 密码: 工具 -> 修改密码。若忘记密码，可删除数据目录下的 auth.wla 重置。\n"
+      L"- 数据兼容: 旧版本的 auth.wla 会在导入导出时一并处理，但当前版本不再启用密码登录。\n"
       L"\n"
       L"快捷键:\n"
       L"- Ctrl+S 保存\n"
@@ -3592,7 +3883,6 @@ static void ShowHelp(AppState* s) {
       L"- Ctrl+P 预览当前条目\n"
       L"- Ctrl+Shift+P 预览当天全部\n"
       L"- Ctrl+K 管理分类\n"
-      L"- Ctrl+T 管理长期任务\n"
       L"- F1 使用说明\n";
   ShowInfoBox(s->hwnd, text, L"WorkLogLite 使用说明");
 }
@@ -3689,26 +3979,57 @@ static LRESULT CALLBACK CatWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
       int row = ScalePx(hwnd, 28);
       int btn_w = ScalePx(hwnd, 110);
       int btn_h = ScalePx(hwnd, 30);
+      int action_gap = ScalePx(hwnd, 8);
+      int footer_gap = ScalePx(hwnd, 10);
+
+      bool split_actions = w < ScalePx(hwnd, 720);
+      int action_rows = split_actions ? 2 : 1;
+      int actions_h = action_rows * btn_h + (action_rows - 1) * action_gap;
+      int footer_h = btn_h;
+      int list_h = h - (pad * 4 + row + actions_h + footer_gap + footer_h);
+      if (list_h < ScalePx(hwnd, 160)) list_h = ScalePx(hwnd, 160);
 
       int y = pad;
-      MoveWindow(s->list, pad, y, w - 2 * pad, h - (pad * 3 + row + btn_h), TRUE);
-      y += h - (pad * 3 + row + btn_h);
-      y += pad;
+      MoveWindow(s->list, pad, y, w - 2 * pad, list_h, TRUE);
+      y += list_h + pad;
 
-      int edit_w = w - 2 * pad - (pad + btn_w) * 3;
-      if (edit_w < ScalePx(hwnd, 120)) edit_w = ScalePx(hwnd, 120);
-      MoveWindow(s->edit, pad, y, edit_w, row, TRUE);
+      MoveWindow(s->edit, pad, y, w - 2 * pad, row, TRUE);
+      y += row + action_gap;
 
-      int x = pad + edit_w + pad;
-      MoveWindow(s->btn_add, x, y, btn_w, btn_h, TRUE);
-      x += btn_w + pad;
-      MoveWindow(s->btn_rename, x, y, btn_w, btn_h, TRUE);
-      x += btn_w + pad;
-      MoveWindow(s->btn_del, x, y, btn_w, btn_h, TRUE);
+      if (!split_actions) {
+        int total_actions_w = btn_w * 3 + action_gap * 2;
+        int x = w - pad - total_actions_w;
+        if (x < pad) x = pad;
+        MoveWindow(s->btn_add, x, y, btn_w, btn_h, TRUE);
+        x += btn_w + action_gap;
+        MoveWindow(s->btn_rename, x, y, btn_w, btn_h, TRUE);
+        x += btn_w + action_gap;
+        MoveWindow(s->btn_del, x, y, btn_w, btn_h, TRUE);
+      } else {
+        int half_w = (w - pad * 2 - action_gap) / 2;
+        int del_w = w - pad * 2;
+        if (half_w < ScalePx(hwnd, 120)) half_w = ScalePx(hwnd, 120);
+        MoveWindow(s->btn_add, pad, y, half_w, btn_h, TRUE);
+        MoveWindow(s->btn_rename, pad + half_w + action_gap, y, half_w, btn_h, TRUE);
+        y += btn_h + action_gap;
+        MoveWindow(s->btn_del, pad, y, del_w, btn_h, TRUE);
+      }
 
       int y2 = h - pad - btn_h;
-      MoveWindow(s->btn_cancel, w - pad - btn_w, y2, btn_w, btn_h, TRUE);
-      MoveWindow(s->btn_save, w - pad * 2 - btn_w * 2, y2, btn_w, btn_h, TRUE);
+      int save_w = ScalePx(hwnd, 130);
+      int cancel_w = ScalePx(hwnd, 110);
+      int footer_total_w = save_w + cancel_w + action_gap;
+      int x2 = w - pad - footer_total_w;
+      if (x2 < pad) x2 = pad;
+      MoveWindow(s->btn_save, x2, y2, save_w, btn_h, TRUE);
+      MoveWindow(s->btn_cancel, x2 + save_w + action_gap, y2, cancel_w, btn_h, TRUE);
+      return 0;
+    }
+    case WM_GETMINMAXINFO: {
+      auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+      if (!mmi) return 0;
+      mmi->ptMinTrackSize.x = ScalePx(hwnd, 560);
+      mmi->ptMinTrackSize.y = ScalePx(hwnd, 420);
       return 0;
     }
     case WM_COMMAND: {
@@ -3731,6 +4052,8 @@ static LRESULT CALLBACK CatWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
           NormalizeCategories(&s->working);
           CatRefreshList(s);
         }
+        SetWindowTextW(s->edit, L"");
+        SetFocus(s->edit);
         return 0;
       }
       if (id == 4) {  // rename
@@ -3805,12 +4128,14 @@ static void ShowManageCategoriesWindow(AppState* app) {
 
   HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, wc.lpszClassName, L"管理分类",
                               WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 720, 520,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 760, 560,
                               app->hwnd, nullptr, wc.hInstance, &state);
   if (!hwnd) {
     ShowLastErrorBox(app->hwnd, L"CreateWindowEx(Categories)");
     return;
   }
+
+  CenterOwnedWindowSimple(hwnd, app->hwnd);
 
   EnableWindow(app->hwnd, FALSE);
   while (IsWindow(hwnd)) {
@@ -4253,8 +4578,11 @@ static void SetMaterialsDirForSelected(AppState* s) {
     if (!PickFolderDialog(s->hwnd, L"选择长期任务材料目录(本地)", &picked)) return;
     if (!ConfirmMaterialsPathIfExternal(s->hwnd, picked)) return;
     t->materials_dir = picked;
+    if (s->editing_index == sel) s->editor_materials_dir = picked;
     std::wstring terr;
     SaveTasks(s->tasks, &terr);
+    RefreshList(s);
+    UpdateStatusBar(s);
     ShowToast(s, L"已设置该长期任务的材料路径");
     return;
   }
@@ -4266,6 +4594,7 @@ static void SetMaterialsDirForSelected(AppState* s) {
   e.materials_dir = picked;
   if (s->editing_index == sel) s->editor_materials_dir = picked;
   SetEditorDirty(s, true);
+  RefreshList(s);
   UpdateStatusBar(s);
   ShowToast(s, L"已设置该条目的材料路径(保存后写入数据)");
 }
@@ -4285,14 +4614,18 @@ static void ClearMaterialsDirForSelected(AppState* s) {
     Task* t = FindTaskById(s, e.task_id);
     if (!t) return;
     t->materials_dir.clear();
+    if (s->editing_index == sel) s->editor_materials_dir.clear();
     std::wstring terr;
     SaveTasks(s->tasks, &terr);
+    RefreshList(s);
+    UpdateStatusBar(s);
     ShowToast(s, L"已清除该长期任务的自定义材料路径");
     return;
   }
   e.materials_dir.clear();
   if (s->editing_index == sel) s->editor_materials_dir.clear();
   SetEditorDirty(s, true);
+  RefreshList(s);
   UpdateStatusBar(s);
   ShowToast(s, L"已清除该条目的自定义材料路径(保存后写入数据)");
 }
@@ -5222,7 +5555,6 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     }
     case WM_COMMAND: {
       int id = LOWORD(wParam);
-      int code = HIWORD(wParam);
       if (id == 7) {  // new
         TaskClearFields(s);
         HWND h = GetComboEditHandle(s->cb_category);
@@ -5403,12 +5735,103 @@ static void Layout(AppState* s) {
   }
 
   int pad = ScalePx(s->hwnd, 10);
-  int left_w = ScalePx(s->hwnd, 260);
-  int top_h = ScalePx(s->hwnd, 240);
-  int row_h = ScalePx(s->hwnd, 26);
-  int lbl_h = ScalePx(s->hwnd, 18);
-  int btn_h = ScalePx(s->hwnd, 30);
-  int btn_w = ScalePx(s->hwnd, 72);
+  int left_w = ScalePx(s->hwnd, 272);
+  int top_h = ScalePx(s->hwnd, 248);
+  int row_h = ScalePx(s->hwnd, 28);
+  int lbl_h = ScalePx(s->hwnd, 20);
+  int btn_h = ScalePx(s->hwnd, 36);
+  int btn_w = ScalePx(s->hwnd, 96);
+  int body_btn_w = ScalePx(s->hwnd, 106);
+
+  auto set_vis = [](HWND hwnd, bool visible) {
+    if (hwnd) ShowWindow(hwnd, visible ? SW_SHOW : SW_HIDE);
+  };
+  auto set_office_visible = [&](bool visible) {
+    set_vis(s->grp_office, visible);
+    for (HWND b : {s->btn_screenshot, s->btn_quick_reply, s->btn_timestamp, s->btn_focus_timer, s->btn_calc,
+                   s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials, s->btn_open_materials,
+                   s->btn_set_materials, s->btn_color_picker, s->btn_paste_plain, s->btn_record_system,
+                   s->btn_record_mic, s->btn_date_separator}) {
+      set_vis(b, visible);
+    }
+  };
+
+  bool maximized = s->editor_maximized;
+  set_vis(s->cal, !maximized);
+  set_vis(s->st_day, !maximized);
+  set_vis(s->list, !maximized);
+  set_office_visible(!maximized);
+  set_vis(s->lbl_category, !maximized);
+  set_vis(s->lbl_start, !maximized);
+  set_vis(s->lbl_end, !maximized);
+  set_vis(s->lbl_status, !maximized);
+  set_vis(s->cb_category, !maximized);
+  set_vis(s->ed_start, !maximized);
+  set_vis(s->ed_end, !maximized);
+  set_vis(s->cb_status, !maximized);
+  set_vis(s->lbl_title, TRUE);
+  set_vis(s->ed_title, TRUE);
+  set_vis(s->lbl_body, TRUE);
+  set_vis(s->btn_body_maximize, TRUE);
+  set_vis(s->btn_new, TRUE);
+  set_vis(s->btn_save, TRUE);
+  set_vis(s->btn_preview, TRUE);
+  set_vis(s->btn_del, TRUE);
+  for (HWND b : {s->fmt_bold, s->fmt_italic, s->fmt_underline, s->fmt_superscript, s->fmt_subscript,
+                 s->fmt_numbering, s->fmt_bullet, s->fmt_markdown,
+                 s->fmt_align_left, s->fmt_align_center, s->fmt_align_right, s->fmt_indent_dec, s->fmt_indent_inc,
+                 s->fmt_clear}) {
+    set_vis(b, TRUE);
+  }
+
+  if (maximized) {
+    int action_gap = ScalePx(s->hwnd, 10);
+    int action_w = btn_w * 4 + action_gap * 3;
+    int y = pad;
+    int action_x = w - pad - action_w;
+    if (action_x < pad) action_x = pad;
+    int bx = action_x;
+    MoveWindow(s->btn_new, bx, y, btn_w, btn_h, TRUE);
+    bx += btn_w + action_gap;
+    MoveWindow(s->btn_save, bx, y, btn_w, btn_h, TRUE);
+    bx += btn_w + action_gap;
+    MoveWindow(s->btn_preview, bx, y, btn_w, btn_h, TRUE);
+    bx += btn_w + action_gap;
+    MoveWindow(s->btn_del, bx, y, btn_w, btn_h, TRUE);
+
+    y += btn_h + ScalePx(s->hwnd, 6);
+    MoveWindow(s->lbl_title, pad, y, w - pad * 2, lbl_h, TRUE);
+    y += lbl_h + ScalePx(s->hwnd, 2);
+    MoveWindow(s->ed_title, pad, y, w - pad * 2, row_h, TRUE);
+    y += row_h + pad;
+
+    int body_label_w = (std::max)(ScalePx(s->hwnd, 160), w - pad * 3 - body_btn_w);
+    MoveWindow(s->lbl_body, pad, y, body_label_w, lbl_h, TRUE);
+    MoveWindow(s->btn_body_maximize, w - pad - body_btn_w, y - ScalePx(s->hwnd, 4), body_btn_w, btn_h, TRUE);
+    y += btn_h + ScalePx(s->hwnd, 4);
+
+    int tbh = ScalePx(s->hwnd, 26);
+    int tbw = ScalePx(s->hwnd, 30);
+    int tb_pad = ScalePx(s->hwnd, 6);
+    int tx = pad;
+    int ty = y;
+    int wrap_right = w - pad;
+    for (HWND b : {s->fmt_bold, s->fmt_italic, s->fmt_underline, s->fmt_superscript, s->fmt_subscript,
+                   s->fmt_numbering, s->fmt_bullet, s->fmt_markdown,
+                   s->fmt_align_left, s->fmt_align_center, s->fmt_align_right, s->fmt_indent_dec, s->fmt_indent_inc,
+                   s->fmt_clear}) {
+      if (!b) continue;
+      if (tx + tbw > wrap_right) {
+        tx = pad;
+        ty += tbh + tb_pad;
+      }
+      MoveWindow(b, tx, ty, tbw, tbh, TRUE);
+      tx += tbw + tb_pad;
+    }
+    y = ty + tbh + ScalePx(s->hwnd, 4);
+    MoveWindow(s->ed_body, pad, y, w - pad * 2, h - y - pad, TRUE);
+    return;
+  }
 
   MoveWindow(s->cal, pad, pad, left_w, top_h, TRUE);
 
@@ -5422,11 +5845,12 @@ static void Layout(AppState* s) {
   int oy0 = office_y + ScalePx(s->hwnd, 26);
   int ox0 = pad + inner;
   int cols = 2;
-  int bh = ScalePx(s->hwnd, 32);
+  int bh = ScalePx(s->hwnd, 34);
   int bw = (left_w - 2 * inner - gap) / cols;
   std::vector<HWND> btns = {s->btn_screenshot, s->btn_quick_reply, s->btn_timestamp, s->btn_focus_timer,
-                            s->btn_calc, s->btn_data_dir, s->btn_screenshot_dir, s->btn_color_picker, s->btn_paste_plain,
-                            s->btn_record_system, s->btn_record_mic};
+                            s->btn_calc, s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials, s->btn_open_materials,
+                            s->btn_set_materials, s->btn_color_picker, s->btn_paste_plain, s->btn_record_system,
+                            s->btn_record_mic, s->btn_date_separator};
   for (size_t i = 0; i < btns.size(); i++) {
     HWND b = btns[i];
     if (!b) continue;
@@ -5440,6 +5864,16 @@ static void Layout(AppState* s) {
   int right_x = pad + left_w + pad;
   int right_w = w - right_x - pad;
   int y = pad;
+  int action_gap = ScalePx(s->hwnd, 10);
+  int action_w = btn_w * 4 + action_gap * 3;
+  int pref_cat_w = ScalePx(s->hwnd, 160);
+  int pref_date_w = ScalePx(s->hwnd, 130);
+  int pref_status_w = ScalePx(s->hwnd, 110);
+  int min_cat_w = ScalePx(s->hwnd, 120);
+  int min_date_w = ScalePx(s->hwnd, 118);
+  int min_status_w = ScalePx(s->hwnd, 90);
+  int min_meta_w = min_cat_w + min_date_w + min_date_w + min_status_w + pad * 3;
+  bool split_actions = right_w < (min_meta_w + pad + action_w);
 
   MoveWindow(s->st_day, right_x, y, right_w, lbl_h, TRUE);
   y += lbl_h + ScalePx(s->hwnd, 4);
@@ -5447,47 +5881,87 @@ static void Layout(AppState* s) {
   MoveWindow(s->list, right_x, y, right_w, top_h - lbl_h - ScalePx(s->hwnd, 4), TRUE);
   y += top_h + pad;
 
+  int fields_w = split_actions ? right_w : (right_w - action_w - pad);
+  if (fields_w < min_meta_w) fields_w = min_meta_w;
+  int cat_w = pref_cat_w;
+  int start_w = pref_date_w;
+  int end_w = pref_date_w;
+  int status_w = pref_status_w;
+  int pref_meta_w = pref_cat_w + pref_date_w + pref_date_w + pref_status_w + pad * 3;
+  if (fields_w < pref_meta_w) {
+    int available = fields_w - pad * 3;
+    int base_total = min_cat_w + min_date_w + min_date_w + min_status_w;
+    int extra = available - base_total;
+    if (extra < 0) extra = 0;
+    int extra_total = (pref_cat_w - min_cat_w) + (pref_date_w - min_date_w) + (pref_date_w - min_date_w) + (pref_status_w - min_status_w);
+    auto share_extra = [&](int pref, int minv) {
+      if (extra_total <= 0) return minv;
+      return minv + extra * (pref - minv) / extra_total;
+    };
+    cat_w = share_extra(pref_cat_w, min_cat_w);
+    start_w = share_extra(pref_date_w, min_date_w);
+    end_w = share_extra(pref_date_w, min_date_w);
+    status_w = available - cat_w - start_w - end_w;
+    if (status_w < min_status_w) status_w = min_status_w;
+  }
+
   // Labels for row
   int x = right_x;
-  MoveWindow(s->lbl_category, x, y, ScalePx(s->hwnd, 140), lbl_h, TRUE);
-  x += ScalePx(s->hwnd, 140) + pad;
-  MoveWindow(s->lbl_start, x, y, ScalePx(s->hwnd, 120), lbl_h, TRUE);
-  x += ScalePx(s->hwnd, 120) + pad;
-  MoveWindow(s->lbl_end, x, y, ScalePx(s->hwnd, 120), lbl_h, TRUE);
-  x += ScalePx(s->hwnd, 120) + pad;
-  MoveWindow(s->lbl_status, x, y, ScalePx(s->hwnd, 90), lbl_h, TRUE);
+  MoveWindow(s->lbl_category, x, y, cat_w, lbl_h, TRUE);
+  x += cat_w + pad;
+  MoveWindow(s->lbl_start, x, y, start_w, lbl_h, TRUE);
+  x += start_w + pad;
+  MoveWindow(s->lbl_end, x, y, end_w, lbl_h, TRUE);
+  x += end_w + pad;
+  MoveWindow(s->lbl_status, x, y, status_w, lbl_h, TRUE);
 
   // Category / Start / End row
   y += lbl_h + ScalePx(s->hwnd, 2);
   x = right_x;
   // For combobox, the "height" controls dropdown height; keep it tall enough for suggestions.
-  MoveWindow(s->cb_category, x, y, ScalePx(s->hwnd, 140), row_h * 10, TRUE);
-  x += ScalePx(s->hwnd, 140) + pad;
-  MoveWindow(s->ed_start, x, y, ScalePx(s->hwnd, 120), row_h, TRUE);
-  x += ScalePx(s->hwnd, 120) + pad;
-  MoveWindow(s->ed_end, x, y, ScalePx(s->hwnd, 120), row_h, TRUE);
-  x += ScalePx(s->hwnd, 120) + pad;
-  MoveWindow(s->cb_status, x, y, ScalePx(s->hwnd, 90), row_h * 10, TRUE);
+  MoveWindow(s->cb_category, x, y, cat_w, row_h * 10, TRUE);
+  x += cat_w + pad;
+  MoveWindow(s->ed_start, x, y, start_w, row_h, TRUE);
+  x += start_w + pad;
+  MoveWindow(s->ed_end, x, y, end_w, row_h, TRUE);
+  x += end_w + pad;
+  MoveWindow(s->cb_status, x, y, status_w, row_h * 10, TRUE);
 
-  // Buttons on the right
-  int bx = right_x + right_w - btn_w;
-  MoveWindow(s->btn_new, bx, y, btn_w, btn_h, TRUE);
-  bx -= pad + btn_w;
-  MoveWindow(s->btn_save, bx, y, btn_w, btn_h, TRUE);
-  bx -= pad + btn_w;
-  MoveWindow(s->btn_preview, bx, y, btn_w, btn_h, TRUE);
-  bx -= pad + btn_w;
-  MoveWindow(s->btn_del, bx, y, btn_w, btn_h, TRUE);
-
-  y += row_h + pad;
+  int actions_y = y;
+  if (!split_actions) {
+    int bx = right_x + right_w - action_w;
+    if (bx < right_x) bx = right_x;
+    MoveWindow(s->btn_new, bx, actions_y, btn_w, btn_h, TRUE);
+    bx += btn_w + action_gap;
+    MoveWindow(s->btn_save, bx, actions_y, btn_w, btn_h, TRUE);
+    bx += btn_w + action_gap;
+    MoveWindow(s->btn_preview, bx, actions_y, btn_w, btn_h, TRUE);
+    bx += btn_w + action_gap;
+    MoveWindow(s->btn_del, bx, actions_y, btn_w, btn_h, TRUE);
+    y += row_h + pad;
+  } else {
+    y += row_h + ScalePx(s->hwnd, 8);
+    int bx = right_x + right_w - action_w;
+    if (bx < right_x) bx = right_x;
+    MoveWindow(s->btn_new, bx, y, btn_w, btn_h, TRUE);
+    bx += btn_w + action_gap;
+    MoveWindow(s->btn_save, bx, y, btn_w, btn_h, TRUE);
+    bx += btn_w + action_gap;
+    MoveWindow(s->btn_preview, bx, y, btn_w, btn_h, TRUE);
+    bx += btn_w + action_gap;
+    MoveWindow(s->btn_del, bx, y, btn_w, btn_h, TRUE);
+    y += btn_h + pad;
+  }
 
   MoveWindow(s->lbl_title, right_x, y, right_w, lbl_h, TRUE);
   y += lbl_h + ScalePx(s->hwnd, 2);
   MoveWindow(s->ed_title, right_x, y, right_w, row_h, TRUE);
   y += row_h + pad;
 
-  MoveWindow(s->lbl_body, right_x, y, right_w, lbl_h, TRUE);
-  y += lbl_h + ScalePx(s->hwnd, 2);
+  int body_label_w = (std::max)(ScalePx(s->hwnd, 160), right_w - body_btn_w - pad);
+  MoveWindow(s->lbl_body, right_x, y, body_label_w, lbl_h, TRUE);
+  MoveWindow(s->btn_body_maximize, right_x + right_w - body_btn_w, y - ScalePx(s->hwnd, 4), body_btn_w, btn_h, TRUE);
+  y += btn_h + ScalePx(s->hwnd, 2);
 
   // Formatting toolbar row (compact).
   int tbh = ScalePx(s->hwnd, 26);
@@ -5495,14 +5969,20 @@ static void Layout(AppState* s) {
   int tb_pad = ScalePx(s->hwnd, 6);
   int tx = right_x;
   int ty = y;
-  for (HWND b : {s->fmt_bold, s->fmt_italic, s->fmt_underline, s->fmt_numbering, s->fmt_bullet,
-                 s->fmt_align_left, s->fmt_align_center, s->fmt_align_right,
-                 s->fmt_indent_dec, s->fmt_indent_inc, s->fmt_clear}) {
+  int wrap_right = right_x + right_w;
+  for (HWND b : {s->fmt_bold, s->fmt_italic, s->fmt_underline, s->fmt_superscript, s->fmt_subscript,
+                 s->fmt_numbering, s->fmt_bullet, s->fmt_markdown,
+                 s->fmt_align_left, s->fmt_align_center, s->fmt_align_right, s->fmt_indent_dec, s->fmt_indent_inc,
+                 s->fmt_clear}) {
     if (!b) continue;
+    if (tx + tbw > wrap_right) {
+      tx = right_x;
+      ty += tbh + tb_pad;
+    }
     MoveWindow(b, tx, ty, tbw, tbh, TRUE);
     tx += tbw + tb_pad;
   }
-  y += tbh + ScalePx(s->hwnd, 4);
+  y = ty + tbh + ScalePx(s->hwnd, 4);
 
   MoveWindow(s->ed_body, right_x, y, right_w, h - y - pad, TRUE);
 }
@@ -5582,12 +6062,7 @@ static HMENU CreateAppMenu() {
   AppendMenuW(tools, MF_STRING, IDM_CLEAR_ALL_DATA, L"清空全部数据(重置)...");
   AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(tools, MF_STRING, IDM_MANAGE_CATEGORIES, L"管理分类...\tCtrl+K");
-  AppendMenuW(tools, MF_STRING, IDM_MANAGE_TASKS, L"管理长期任务...\tCtrl+T");
-  AppendMenuW(tools, MF_STRING, IDM_VIEW_TASK_PROGRESS, L"查看任务每日进展汇总...");
-  AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(tools, MF_STRING, IDM_GENERATE_DEMO_DATA, L"生成示例数据(演示)...");
-  AppendMenuW(tools, MF_STRING, IDM_CHANGE_PASSWORD, L"修改密码...");
-  AppendMenuW(tools, MF_STRING, IDM_DISABLE_PASSWORD_LOGIN, L"取消密码登录(不推荐)...");
   AppendMenuW(menu, MF_POPUP, (UINT_PTR)tools, L"工具");
 
   HMENU help = CreateMenu();
@@ -5600,6 +6075,16 @@ static void UpdateEditorFromListSelection(AppState* s) {
   int idx = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
   if (idx < 0 || idx >= (int)s->day.entries.size()) return;
   FillEditorFromEntry(s, s->day.entries[(size_t)idx], idx);
+}
+
+static std::vector<int> GetSelectedEntryIndices(AppState* s) {
+  std::vector<int> out;
+  if (!s || !s->list) return out;
+  int idx = -1;
+  while ((idx = ListView_GetNextItem(s->list, idx, LVNI_SELECTED)) >= 0) {
+    if (idx < (int)s->day.entries.size()) out.push_back(idx);
+  }
+  return out;
 }
 
 static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -5622,9 +6107,9 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                                  0, 0, 10, 10, hwnd, (HMENU)IDC_ST_DAY, nullptr, nullptr);
 
       s->list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-                                WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                                WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | LVS_REPORT | LVS_SHOWSELALWAYS,
                                 0, 0, 10, 10, hwnd, (HMENU)IDC_LIST, nullptr, nullptr);
-      ListView_SetExtendedListViewStyle(s->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+      ListView_SetExtendedListViewStyle(s->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
       InitListColumns(s->list);
 
       s->lbl_category = CreateWindowExW(0, L"STATIC", L"分类(必填)",
@@ -5645,10 +6130,10 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                                        0, 0, 10, 10, hwnd, (HMENU)IDC_CATEGORY, nullptr, nullptr);
 
       s->ed_start = CreateWindowExW(0, DATETIMEPICK_CLASSW, L"",
-                                    WS_CHILD | WS_VISIBLE | DTS_SHORTDATEFORMAT | DTS_SHOWNONE | WS_TABSTOP,
+                                    WS_CHILD | WS_VISIBLE | DTS_SHORTDATEFORMAT | WS_TABSTOP,
                                     0, 0, 10, 10, hwnd, (HMENU)IDC_START, nullptr, nullptr);
       s->ed_end = CreateWindowExW(0, DATETIMEPICK_CLASSW, L"",
-                                  WS_CHILD | WS_VISIBLE | DTS_SHORTDATEFORMAT | DTS_SHOWNONE | WS_TABSTOP,
+                                  WS_CHILD | WS_VISIBLE | DTS_SHORTDATEFORMAT | WS_TABSTOP,
                                   0, 0, 10, 10, hwnd, (HMENU)IDC_END, nullptr, nullptr);
 
       s->cb_status = CreateWindowExW(0, L"COMBOBOX", L"",
@@ -5683,12 +6168,21 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       s->fmt_underline = CreateWindowExW(0, L"BUTTON", L"U",
                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
                                          0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_UNDERLINE, nullptr, nullptr);
+      s->fmt_superscript = CreateWindowExW(0, L"BUTTON", L"x2",
+                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                           0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_SUPERSCRIPT, nullptr, nullptr);
+      s->fmt_subscript = CreateWindowExW(0, L"BUTTON", L"x_",
+                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                         0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_SUBSCRIPT, nullptr, nullptr);
       s->fmt_numbering = CreateWindowExW(0, L"BUTTON", L"1.",
                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
                                          0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_NUMBERING, nullptr, nullptr);
       s->fmt_bullet = CreateWindowExW(0, L"BUTTON", L"•",
                                       WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
                                       0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_BULLET, nullptr, nullptr);
+      s->fmt_markdown = CreateWindowExW(0, L"BUTTON", L"MD",
+                                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                        0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_MARKDOWN, nullptr, nullptr);
       s->fmt_align_left = CreateWindowExW(0, L"BUTTON", L"L",
                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
                                           0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_ALIGN_LEFT, nullptr, nullptr);
@@ -5707,6 +6201,9 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       s->fmt_clear = CreateWindowExW(0, L"BUTTON", L"清",
                                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
                                      0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_CLEAR, nullptr, nullptr);
+      s->btn_body_maximize = CreateWindowExW(0, L"BUTTON", L"最大化编辑",
+                                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                             0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_BODY_MAXIMIZE, nullptr, nullptr);
 
       s->ed_body = CreateWindowExW(WS_EX_CLIENTEDGE, L"RICHEDIT50W", L"",
                                    WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_DISABLENOSCROLL | ES_NOHIDESEL |
@@ -5731,7 +6228,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                                   0, 0, 0, 0, hwnd, (HMENU)IDC_STATUS, nullptr, nullptr);
 
       // Left-bottom "office" helpers.
-      s->grp_office = CreateWindowExW(0, L"BUTTON", L"办公",
+      s->grp_office = CreateWindowExW(0, L"BUTTON", L"工作区",
                                       WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
                                       0, 0, 10, 10, hwnd, (HMENU)IDC_GRP_OFFICE, nullptr, nullptr);
       DWORD office_btn_style = WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP;
@@ -5756,12 +6253,24 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       s->btn_screenshot_dir = CreateWindowExW(0, L"BUTTON", L"截图目录",
                                               office_btn_style,
                                               0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_SCREENSHOT_DIR, nullptr, nullptr);
+      s->btn_task_materials = CreateWindowExW(0, L"BUTTON", L"便签",
+                                              office_btn_style,
+                                              0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_TASK_MATERIALS_ROOT, nullptr, nullptr);
+      s->btn_open_materials = CreateWindowExW(0, L"BUTTON", L"日志目录",
+                                              office_btn_style,
+                                              0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_OPEN_MATERIALS, nullptr, nullptr);
+      s->btn_set_materials = CreateWindowExW(0, L"BUTTON", L"材料根目录",
+                                             office_btn_style,
+                                             0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_SET_MATERIALS, nullptr, nullptr);
       s->btn_color_picker = CreateWindowExW(0, L"BUTTON", L"取色器",
                                             office_btn_style,
                                             0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_COLOR_PICKER, nullptr, nullptr);
       s->btn_paste_plain = CreateWindowExW(0, L"BUTTON", L"纯贴",
                                            office_btn_style,
                                            0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_PASTE_PLAIN, nullptr, nullptr);
+      s->btn_date_separator = CreateWindowExW(0, L"BUTTON", L"时间分隔",
+                                              office_btn_style,
+                                              0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_DATE_SEPARATOR, nullptr, nullptr);
       s->btn_record_system = CreateWindowExW(0, L"BUTTON", L"录系统声",
                                              office_btn_style,
                                              0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_RECORD_SYSTEM, nullptr, nullptr);
@@ -5772,24 +6281,21 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       // Fonts
       for (HWND h : {s->cal, s->st_day, s->list, s->lbl_category, s->lbl_start, s->lbl_end, s->lbl_title, s->lbl_body,
                      s->lbl_status, s->cb_category, s->ed_start, s->ed_end, s->cb_status, s->ed_title,
-                     s->fmt_bold, s->fmt_italic, s->fmt_underline, s->fmt_numbering, s->fmt_bullet,
-                     s->fmt_align_left, s->fmt_align_center, s->fmt_align_right, s->fmt_indent_inc, s->fmt_indent_dec, s->fmt_clear,
+                     s->fmt_bold, s->fmt_italic, s->fmt_underline, s->fmt_superscript, s->fmt_subscript,
+                     s->fmt_numbering, s->fmt_bullet, s->fmt_markdown,
+                     s->fmt_align_left, s->fmt_align_center, s->fmt_align_right, s->fmt_indent_inc,
+                     s->fmt_indent_dec, s->fmt_clear,
+                     s->btn_body_maximize,
                      s->ed_body, s->status,
-                      s->btn_new, s->btn_save, s->btn_preview, s->btn_del,
+                       s->btn_new, s->btn_save, s->btn_preview, s->btn_del,
                      s->grp_office, s->btn_screenshot, s->btn_quick_reply, s->btn_timestamp, s->btn_focus_timer, s->btn_calc,
-                     s->btn_data_dir, s->btn_screenshot_dir, s->btn_color_picker, s->btn_paste_plain,
+                     s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials, s->btn_open_materials, s->btn_set_materials,
+                     s->btn_color_picker, s->btn_paste_plain, s->btn_date_separator,
                      s->btn_record_system, s->btn_record_mic}) {
         SetControlFont(h, s->font);
       }
 
       SetMenu(hwnd, CreateAppMenu());
-
-      // Password gate (offline, local). First run will require setting a password.
-      // NOTE: This is not data encryption; it is an access gate for the UI.
-      if (!EnsureAuthenticated(hwnd)) {
-        DestroyWindow(hwnd);
-        return 0;
-      }
 
       // Load categories
       {
@@ -5816,7 +6322,9 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       // Field hints
       SetEditCue(GetComboEditHandle(s->cb_category), L"例如: 工作 / 会议 / 目标 / 沟通 / 研发");
       SetEditCue(s->ed_title, L"一句话概括今天这件事");
-      SetEditCue(s->ed_body, L"富文本正文。快捷键: Ctrl+B/I/U, Ctrl+Shift+7 编号, Ctrl+Shift+8 项目符号, Ctrl+Alt+L/E/R 段落对齐");
+      SetEditCue(s->ed_body, L"富文本正文。可直接输入 Markdown 后点 MD。快捷键: Ctrl+B/I/U, Ctrl+滚轮缩放, Ctrl+0 重置, Ctrl+Shift+7 编号, Ctrl+Shift+8 项目符号, Ctrl+Alt+L/E/R 段落对齐");
+      SetWindowSubclass(s->ed_body, BodyEditSubclassProc, 1, (DWORD_PTR)s);
+      ApplyBodyZoom(s);
       UpdateAudioRecordButtons(s);
 
       SYSTEMTIME st{};
@@ -5858,18 +6366,42 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
       }
       if (s->audio_timer_id && wParam == s->audio_timer_id) {
+        if (MaybeAutoStopAudioRecording(s, AudioRecordSource::SystemLoopback)) return 0;
+        if (MaybeAutoStopAudioRecording(s, AudioRecordSource::MicrophoneCapture)) return 0;
         UpdateAudioRecordButtons(s);
         UpdateStatusBar(s);
         return 0;
       }
+      if (s->autosave_timer_id && wParam == s->autosave_timer_id) {
+        KillTimer(s->hwnd, s->autosave_timer_id);
+        s->autosave_timer_id = 0;
+        if (s->editing_index >= 0 && IsEditorTrulyDirty(s)) {
+          if (SaveCurrent(s)) ShowToast(s, L"已自动保存");
+        }
+        return 0;
+      }
+      return 0;
+    }
+
+    case WM_MOUSEWHEEL: {
+      if (!s) return DefWindowProcW(hwnd, msg, wParam, lParam);
+      bool ctrl = (GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) != 0;
+      if (!ctrl) return DefWindowProcW(hwnd, msg, wParam, lParam);
+      HWND focus = GetFocus();
+      if (focus != s->ed_body) return DefWindowProcW(hwnd, msg, wParam, lParam);
+      short delta = GET_WHEEL_DELTA_WPARAM(wParam);
+      if (delta == 0) return 0;
+      AdjustBodyZoomFromWheel(s, delta);
+      UpdateStatusBar(s);
       return 0;
     }
 
     case WM_DRAWITEM: {
       int id = (int)wParam;
       if (id == IDC_BTN_SCREENSHOT || id == IDC_BTN_QUICK_REPLY || id == IDC_BTN_TIMESTAMP || id == IDC_BTN_FOCUS_TIMER ||
-          id == IDC_BTN_CALC || id == IDC_BTN_DATA_DIR || id == IDC_BTN_SCREENSHOT_DIR || id == IDC_BTN_COLOR_PICKER ||
-          id == IDC_BTN_PASTE_PLAIN || id == IDC_BTN_RECORD_SYSTEM || id == IDC_BTN_RECORD_MIC) {
+          id == IDC_BTN_CALC || id == IDC_BTN_DATA_DIR || id == IDC_BTN_SCREENSHOT_DIR || id == IDC_BTN_TASK_MATERIALS_ROOT ||
+          id == IDC_BTN_OPEN_MATERIALS || id == IDC_BTN_SET_MATERIALS || id == IDC_BTN_COLOR_PICKER ||
+          id == IDC_BTN_PASTE_PLAIN || id == IDC_BTN_DATE_SEPARATOR || id == IDC_BTN_RECORD_SYSTEM || id == IDC_BTN_RECORD_MIC) {
         DrawOfficeButton(s, reinterpret_cast<const DRAWITEMSTRUCT*>(lParam));
         return TRUE;
       }
@@ -5894,7 +6426,12 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
       }
       if (id == IDC_BTN_DEL && code == BN_CLICKED) {
-        int r = MessageBoxW(hwnd, L"确定删除当前条目？", kAppTitle, MB_YESNO | MB_ICONWARNING);
+        std::vector<int> selected = GetSelectedEntryIndices(s);
+        int count = (int)selected.size();
+        if (count <= 0 && s->editing_index >= 0 && s->editing_index < (int)s->day.entries.size()) count = 1;
+        std::wstring prompt = count > 1 ? (L"确定删除当前选中的 " + std::to_wstring(count) + L" 条记录？")
+                                        : L"确定删除当前条目？";
+        int r = MessageBoxW(hwnd, prompt.c_str(), kAppTitle, MB_YESNO | MB_ICONWARNING);
         if (r == IDYES) DeleteCurrent(s);
         return 0;
       }
@@ -5926,8 +6463,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
       }
       if (id == IDC_BTN_CALC && code == BN_CLICKED) {
-        HINSTANCE r = ShellExecuteW(nullptr, L"open", L"calc.exe", nullptr, nullptr, SW_SHOWNORMAL);
-        if ((INT_PTR)r <= 32) ShowInfoBox(s->hwnd, L"无法启动计算器(calc.exe)。", L"提示");
+        ShowUnitCalcWindow(s->hwnd);
         return 0;
       }
       if (id == IDC_BTN_DATA_DIR && code == BN_CLICKED) {
@@ -5937,7 +6473,20 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       if (id == IDC_BTN_SCREENSHOT_DIR && code == BN_CLICKED) {
         std::wstring dir = JoinPath(GetDataRootDir(), L"screenshots");
         EnsureDirExists(dir);
-        ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        OpenPathInShell(s->hwnd, dir, L"截图目录");
+        return 0;
+      }
+      if (id == IDC_BTN_TASK_MATERIALS_ROOT && code == BN_CLICKED) {
+        OpenScratchpadFile(s->hwnd);
+        return 0;
+      }
+      if (id == IDC_BTN_OPEN_MATERIALS && code == BN_CLICKED) {
+        OpenSelectedDayFolder(s);
+        return 0;
+      }
+      if (id == IDC_BTN_SET_MATERIALS && code == BN_CLICKED) {
+        std::wstring dir = GetWorkMaterialsRootDir();
+        OpenPathInShell(s->hwnd, dir, L"材料根目录");
         return 0;
       }
       if (id == IDC_BTN_COLOR_PICKER && code == BN_CLICKED) {
@@ -5946,6 +6495,10 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       }
       if (id == IDC_BTN_PASTE_PLAIN && code == BN_CLICKED) {
         PastePlainTextIntoBody(s);
+        return 0;
+      }
+      if (id == IDC_BTN_DATE_SEPARATOR && code == BN_CLICKED) {
+        InsertDateSeparatorIntoBody(s);
         return 0;
       }
       if (id == IDC_BTN_RECORD_SYSTEM && code == BN_CLICKED) {
@@ -5970,12 +6523,24 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
           ApplyBodyFormatting(s, BodyFmtUnderline);
           return 0;
         }
+        if (id == IDC_FMT_SUPERSCRIPT) {
+          ApplyBodyFormatting(s, BodyFmtSuperscript);
+          return 0;
+        }
+        if (id == IDC_FMT_SUBSCRIPT) {
+          ApplyBodyFormatting(s, BodyFmtSubscript);
+          return 0;
+        }
         if (id == IDC_FMT_NUMBERING) {
           ApplyBodyFormatting(s, BodyFmtNumbering);
           return 0;
         }
         if (id == IDC_FMT_BULLET) {
           ApplyBodyFormatting(s, BodyFmtBullet);
+          return 0;
+        }
+        if (id == IDC_FMT_MARKDOWN) {
+          ApplyMarkdownStylingToBody(s);
           return 0;
         }
         if (id == IDC_FMT_ALIGN_LEFT) {
@@ -6002,10 +6567,16 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
           ApplyBodyFormatting(s, BodyFmtClear);
           return 0;
         }
+        if (id == IDC_BTN_BODY_MAXIMIZE) {
+          SetEditorMaximized(s, !s->editor_maximized);
+          SetFocus(s->ed_body);
+          return 0;
+        }
       }
 
       if ((id == IDC_CATEGORY || id == IDC_START || id == IDC_END || id == IDC_CB_STATUS || id == IDC_TITLE || id == IDC_BODY) &&
           (code == CBN_SELCHANGE || code == EN_CHANGE)) {
+        if (s && s->suppress_editor_change_tracking) return 0;
         SetEditorDirty(s, true);
         UpdateStatusBar(s);
         return 0;
@@ -6108,43 +6679,6 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         ShowManageCategoriesWindow(s);
         return 0;
       }
-      if (id == IDM_MANAGE_TASKS) {
-        if (!PromptSaveIfDirty(s)) return 0;
-        ShowManageTasksWindow(s, nullptr);
-        // Refresh current day to inject updated tasks.
-        LoadSelectedDay(s, s->selected);
-        return 0;
-      }
-      if (id == IDM_CTX_VIEW_TASK_PROGRESS) {
-        int sel = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
-        if (sel < 0 || sel >= (int)s->day.entries.size()) return 0;
-        const Entry& e = s->day.entries[(size_t)sel];
-        if (e.type != EntryType::TaskProgress || e.task_id.empty()) return 0;
-        ViewTaskProgressSummary(s, e.task_id);
-        return 0;
-      }
-      if (id == IDM_CTX_OPEN_TASK_MATERIALS_DIR) {
-        int sel = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
-        if (sel < 0 || sel >= (int)s->day.entries.size()) return 0;
-        const Entry& e = s->day.entries[(size_t)sel];
-        if (e.type != EntryType::TaskProgress || e.task_id.empty()) return 0;
-        Task* t = FindTaskById(s, e.task_id);
-        if (t) {
-          std::wstring dir = TaskMaterialsDirResolved(*t);
-          if (IsNetworkPathForbidden(dir)) {
-            ShowInfoBox(s->hwnd, L"材料路径为网络共享(UNC)，出于安全考虑已禁止打开。请改为本地目录。", L"提示");
-            return 0;
-          }
-          if (!DirExistsW(dir)) {
-            ShowInfoBox(s->hwnd, L"材料路径不存在或不是文件夹。请重新设置材料路径。", L"提示");
-            return 0;
-          }
-          ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-        } else {
-          OpenTaskMaterialsDir(s->hwnd, e.task_id);
-        }
-        return 0;
-      }
       if (id == IDM_CTX_OPEN_MATERIALS_DIR) {
         int sel = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
         if (sel < 0 || sel >= (int)s->day.entries.size()) return 0;
@@ -6158,24 +6692,6 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       }
       if (id == IDM_CTX_CLEAR_MATERIALS_DIR) {
         ClearMaterialsDirForSelected(s);
-        return 0;
-      }
-      if (id == IDM_CTX_CREATE_TASK_FROM_MEETING) {
-        if (!PromptSaveIfDirty(s)) return 0;
-        int sel = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
-        if (sel < 0 || sel >= (int)s->day.entries.size()) return 0;
-        const Entry& e = s->day.entries[(size_t)sel];
-        if (e.type != EntryType::Meeting) return 0;
-
-        Task t = BuildTaskFromMeeting(s->selected, e);
-        ShowManageTasksWindow(s, &t);
-
-        // Refresh caches and current day (task placeholders).
-        {
-          std::wstring terr;
-          LoadTasks(&s->tasks, &terr);
-        }
-        LoadSelectedDay(s, s->selected);
         return 0;
       }
       if (id == IDM_GENERATE_DEMO_DATA) {
@@ -6206,22 +6722,6 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         }
         LoadSelectedDay(s, s->selected);
         ShowInfoBox(hwnd, L"已生成示例数据。建议打开“本季度(按分类)”查看汇总效果。", L"完成");
-        return 0;
-      }
-      if (id == IDM_CHANGE_PASSWORD) {
-        if (!PromptSaveIfDirty(s)) return 0;
-        ChangePasswordFlow(hwnd);
-        return 0;
-      }
-      if (id == IDM_DISABLE_PASSWORD_LOGIN) {
-        if (!PromptSaveIfDirty(s)) return 0;
-        DisablePasswordLoginFlow(hwnd);
-        return 0;
-      }
-      if (id == IDM_VIEW_TASK_PROGRESS) {
-        std::wstring tid;
-        if (!PromptPickTaskId(s, &tid)) return 0;
-        ViewTaskProgressSummary(s, tid);
         return 0;
       }
       if (id == IDM_HELP) {
@@ -6287,18 +6787,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       // a different item than the one the user right-clicked.
       if (hit >= 0 && sel != hit) return 0;
       if (sel < 0 || sel >= (int)s->day.entries.size()) return 0;
-      const Entry& e = s->day.entries[(size_t)sel];
-
       HMENU menu = CreatePopupMenu();
       if (!menu) return 0;
-
-      if (e.type == EntryType::Meeting) {
-        AppendMenuW(menu, MF_STRING, IDM_CTX_CREATE_TASK_FROM_MEETING, L"从此会议创建长期任务...");
-      }
-      if (e.type == EntryType::TaskProgress && !e.task_id.empty()) {
-        AppendMenuW(menu, MF_STRING, IDM_CTX_VIEW_TASK_PROGRESS, L"查看该任务每日进展汇总...");
-        AppendMenuW(menu, MF_STRING, IDM_CTX_OPEN_TASK_MATERIALS_DIR, L"打开任务材料目录");
-      }
 
       AppendMenuW(menu, MF_STRING, IDM_CTX_OPEN_MATERIALS_DIR, L"打开材料目录");
       AppendMenuW(menu, MF_STRING, IDM_CTX_SET_MATERIALS_DIR, L"设置存放路径...");
@@ -6335,12 +6825,27 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       }
 
       if ((hdr->idFrom == IDC_START || hdr->idFrom == IDC_END) && hdr->code == DTN_DATETIMECHANGE) {
+        if (s->suppress_editor_change_tracking) return 0;
         SetEditorDirty(s, true);
         UpdateStatusBar(s);
         return 0;
       }
 
       if (hdr->idFrom == IDC_LIST) {
+        if (hdr->code == LVN_COLUMNCLICK) {
+          auto* lv = reinterpret_cast<NMLISTVIEW*>(lParam);
+          if (!lv) return 0;
+          int col = lv->iSubItem;
+          if (col == 0 || col == 1 || col == 3) {
+            if (s->list_sort_column == col) s->list_sort_desc = !s->list_sort_desc;
+            else {
+              s->list_sort_column = col;
+              s->list_sort_desc = false;
+            }
+            RefreshList(s);
+          }
+          return 0;
+        }
         if (hdr->code == NM_CUSTOMDRAW) {
           auto* cd = reinterpret_cast<NMLVCUSTOMDRAW*>(lParam);
           if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
@@ -6401,7 +6906,12 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     }
 
     case WM_CLOSE: {
-      if (s && !PromptSaveIfDirty(s)) return 0;
+      if (s && s->close_in_progress) return 0;
+      if (s) s->close_in_progress = true;
+      if (s && !PromptSaveIfDirty(s)) {
+        s->close_in_progress = false;
+        return 0;
+      }
       DestroyWindow(hwnd);
       return 0;
     }
@@ -6409,6 +6919,10 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     case WM_DESTROY: {
       if (s) StopFocusTimer(s);
       if (s) {
+        if (s->autosave_timer_id) {
+          KillTimer(s->hwnd, s->autosave_timer_id);
+          s->autosave_timer_id = 0;
+        }
         StopAudioRecorderWithoutPrompt(s, AudioRecordSource::SystemLoopback);
         StopAudioRecorderWithoutPrompt(s, AudioRecordSource::MicrophoneCapture);
         EnsureAudioTimerState(s);
@@ -6470,14 +6984,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
   AppState state{};
 
-  WNDCLASSW wc{};
+  HICON app_icon = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
+  HICON app_icon_sm = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+                                        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+
+  WNDCLASSEXW wc{};
+  wc.cbSize = sizeof(wc);
   wc.lpfnWndProc = MainWndProc;
   wc.hInstance = hInstance;
   wc.lpszClassName = L"WorkLogLiteMainWnd";
   wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
   wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+  wc.hIcon = app_icon;
+  wc.hIconSm = app_icon_sm ? app_icon_sm : app_icon;
 
-  if (!RegisterClassW(&wc)) return 0;
+  if (!RegisterClassExW(&wc)) return 0;
 
   // Size the initial window based on system DPI so that scaled controls are visible without requiring a manual resize.
   UINT sys_dpi = QuerySystemDpiCompat();
@@ -6498,6 +7019,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
                               CW_USEDEFAULT, CW_USEDEFAULT, init_w, init_h,
                               nullptr, nullptr, hInstance, &state);
   if (!hwnd) return 0;
+  if (app_icon) SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)app_icon);
+  if (wc.hIconSm) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)wc.hIconSm);
 
   // Ensure initial size meets our computed minimum (DPI aware). Clamp to work area to avoid going off-screen.
   {
@@ -6567,11 +7090,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
             SendMessageW(hwnd, WM_COMMAND, shift ? IDM_PREVIEW_DAY : IDM_PREVIEW_ENTRY, 0);
             continue;
           }
-          if (msg.wParam == 'T') {
-            SendMessageW(hwnd, WM_COMMAND, IDM_MANAGE_TASKS, 0);
-            continue;
-          }
           if (focus == state.ed_body) {
+            if (shift && msg.wParam == 'M') {
+              ApplyMarkdownStylingToBody(&state);
+              continue;
+            }
+            if (msg.wParam == '0') {
+              SetBodyZoom(&state, 100);
+              continue;
+            }
             if (msg.wParam == 'B') {
               RichToggleCharEffect(state.ed_body, CFE_BOLD);
               SetEditorDirty(&state, true);

@@ -152,7 +152,7 @@ HFONT CreateUiFont(HWND hwnd) {
   HDC hdc = GetDC(hwnd);
   int logPixelsY = hdc ? GetDeviceCaps(hdc, LOGPIXELSY) : 96;
   if (hdc) ReleaseDC(hwnd, hdc);
-  lf.lfHeight = -MulDiv(10, logPixelsY, 72);
+  lf.lfHeight = -MulDiv(11, logPixelsY, 72);
   wcscpy_s(lf.lfFaceName, L"Segoe UI");
   return CreateFontIndirectW(&lf);
 }

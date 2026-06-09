@@ -183,6 +183,9 @@ void TestDayRoundtripAndValidation() {
   note.title = L"跨日事项";
   note.body_plain = L"正文 A";
   day.entries.push_back(note);
+  day.entries.back().status = EntryStatus::Doing;
+  day.entries.back().materials_dir = L"C:\\materials\\entry-note-1";
+  day.entries.back().body_rtf_b64 = Base64Encode("{\\rtf1\\ansi bold}");
 
   Entry task_prog{};
   task_prog.id = L"task-1";
@@ -205,6 +208,10 @@ void TestDayRoundtripAndValidation() {
         loaded.entries[0].end_time == note.end_time &&
         loaded.entries[1].task_id == task_prog.task_id,
         L"Day file roundtrip preserves key fields");
+  Check(loaded.entries[0].status == EntryStatus::Doing &&
+        loaded.entries[0].materials_dir == L"C:\\materials\\entry-note-1" &&
+        loaded.entries[0].body_rtf_b64 == Base64Encode("{\\rtf1\\ansi bold}"),
+        L"Day file roundtrip preserves status, materials dir and rich text");
 
   DayData bad{};
   bad.date = MakeDate(2026, 4, 22);
@@ -244,6 +251,74 @@ void TestLegacyLoadCompatibility() {
         L"Legacy wlmd preserves HH:MM time fields");
 }
 
+void TestMalformedDataTolerance() {
+  std::wstring err;
+
+  SYSTEMTIME day_date = MakeDate(2026, 4, 18);
+  std::wstring broken_day = GetDayFilePath(day_date);
+  std::string broken_day_body =
+      "WLR1\n"
+      "date=2026-04-18\n"
+      "ENTRY\n"
+      "type=note\n"
+      "status=doing\n"
+      "start=2026-04-18\n"
+      "end=2026-04-19\n"
+      "category_b64=5bel5L2c\n"
+      "title_b64=###not-base64###\n"
+      "body_plain_b64=###bad###\n"
+      "body_rtf_b64=cmF3LXJ0Zi1rZWVw\n"
+      "not_a_kv_line\n"
+      "END\n";
+  Check(WriteUtf8FileRaw(broken_day, broken_day_body), L"Malformed WLR fixture written");
+
+  DayData loaded_day{};
+  Check(LoadDayFile(day_date, &loaded_day, &err), L"LoadDayFile tolerates malformed optional fields");
+  Check(loaded_day.entries.size() == 1, L"Malformed WLR still yields one entry");
+  Check(loaded_day.entries[0].id == L"e0001" &&
+        loaded_day.entries[0].status == EntryStatus::Doing &&
+        loaded_day.entries[0].start_time == L"2026-04-18" &&
+        loaded_day.entries[0].end_time == L"2026-04-19",
+        L"Malformed WLR preserves valid core fields and assigns fallback id");
+  Check(loaded_day.entries[0].title.empty() &&
+        loaded_day.entries[0].body_plain.empty() &&
+        !loaded_day.entries[0].category.empty() &&
+        loaded_day.entries[0].body_rtf_b64 == "cmF3LXJ0Zi1rZWVw",
+        L"Malformed WLR skips bad base64 fields but keeps raw rich text");
+
+  std::wstring tasks_path = GetTasksFilePath();
+  std::string broken_tasks_body =
+      "WLT2\n"
+      "TASK\n"
+      "id=task-broken\n"
+      "category_b64=6aG555uu\n"
+      "title_b64=5YiX6KGo5a2Y5Zyo\n"
+      "materials_dir_b64=QzpcXG1hdGVyaWFsc1xcdGFzay1icm9rZW4=\n"
+      "basis_b64=###bad###\n"
+      "desc_plain_b64=###bad###\n"
+      "desc_rtf_b64=cmF3LXRhc2stcnRm\n"
+      "start=not-a-date\n"
+      "end=2026-04-30\n"
+      "status=blocked\n"
+      "END\n";
+  Check(WriteUtf8FileRaw(tasks_path, broken_tasks_body), L"Malformed WLT fixture written");
+
+  std::vector<Task> loaded_tasks;
+  Check(LoadTasks(&loaded_tasks, &err), L"LoadTasks tolerates malformed optional fields");
+  Check(loaded_tasks.size() == 1, L"Malformed WLT still yields one task");
+  Check(loaded_tasks[0].id == L"task-broken" &&
+        loaded_tasks[0].status == EntryStatus::Blocked &&
+        loaded_tasks[0].end.wYear == 2026 &&
+        loaded_tasks[0].end.wMonth == 4 &&
+        loaded_tasks[0].end.wDay == 30,
+        L"Malformed WLT preserves valid task fields");
+  Check(loaded_tasks[0].start.wYear == 0 &&
+        loaded_tasks[0].basis.empty() &&
+        loaded_tasks[0].desc_plain.empty() &&
+        loaded_tasks[0].desc_rtf_b64 == "cmF3LXRhc2stcnRm",
+        L"Malformed WLT skips invalid date and bad base64 fields");
+}
+
 void TestTasksAndReports() {
   Task t{};
   t.id = L"task-alpha";
@@ -255,6 +330,7 @@ void TestTasksAndReports() {
   t.start = MakeDate(2026, 4, 1);
   t.end = MakeDate(2026, 4, 30);
   t.status = EntryStatus::Doing;
+  t.desc_rtf_b64 = Base64Encode("{\\rtf1\\ansi task}");
 
   std::wstring err;
   Check(SaveTasks({t}, &err), L"SaveTasks succeeds for valid task");
@@ -265,6 +341,10 @@ void TestTasksAndReports() {
         tasks[0].title == t.title &&
         tasks[0].materials_dir == t.materials_dir,
         L"Task roundtrip preserves key fields");
+  Check(tasks[0].status == t.status &&
+        tasks[0].basis == t.basis &&
+        tasks[0].desc_rtf_b64 == t.desc_rtf_b64,
+        L"Task roundtrip preserves status, basis and rich text");
   Check(TaskActiveOn(tasks[0], MakeDate(2026, 4, 21)), L"TaskActiveOn true inside range");
   Check(!TaskActiveOn(tasks[0], MakeDate(2026, 5, 1)), L"TaskActiveOn false outside range");
 
@@ -282,6 +362,12 @@ void TestTasksAndReports() {
   bad.title.clear();
   Check(!SaveTasks({bad}, &err), L"SaveTasks rejects missing title");
 
+  bad = t;
+  bad.id = L"task-reversed";
+  bad.start = MakeDate(2026, 4, 30);
+  bad.end = MakeDate(2026, 4, 1);
+  Check(!SaveTasks({bad}, &err), L"SaveTasks rejects reversed date range");
+
   ReportRange r{};
   r.start = MakeDate(2026, 4, 21);
   r.end = MakeDate(2026, 4, 21);
@@ -290,6 +376,9 @@ void TestTasksAndReports() {
   Check(GenerateReportMarkdown(r, &md, &err), L"GenerateReportMarkdown succeeds");
   Check(md.find(L"跨日事项") != std::wstring::npos, L"Report markdown contains note title");
   Check(md.find(L"2026-04-21 ~ 2026-04-23") != std::wstring::npos, L"Report markdown shows date range");
+  std::wstring md_by_cat;
+  Check(GenerateReportMarkdownByCategory(r, &md_by_cat, &err), L"GenerateReportMarkdownByCategory succeeds");
+  Check(!md_by_cat.empty(), L"Category report is not empty");
 
   std::wstring csv;
   Check(GenerateReportCsvFlat(r, &csv, &err), L"GenerateReportCsvFlat succeeds");
@@ -356,6 +445,10 @@ void TestDataOps() {
         L"ResolveWorkLogLiteImportRoot accepts wrapper folder");
   Check(ResolveWorkLogLiteImportRoot(import_src, &resolved) && resolved == import_src,
         L"ResolveWorkLogLiteImportRoot accepts direct data root");
+  std::wstring invalid_import = JoinPath(base, L"not_a_data_root");
+  EnsureDirExists(invalid_import);
+  Check(!ResolveWorkLogLiteImportRoot(invalid_import, &resolved),
+        L"ResolveWorkLogLiteImportRoot rejects unrelated folders");
 
   std::wstring import_dst = JoinPath(base, L"import_live");
   SeedDataSet(import_dst, L"old");
@@ -398,6 +491,8 @@ void TestDataOps() {
 
   Check(!ImportWorkLogLiteData(import_dst, import_dst, nullptr, &err),
         L"Import rejects using the current data folder as source");
+  Check(!ImportWorkLogLiteData(invalid_import, import_dst, nullptr, &err),
+        L"Import rejects folders that are not WorkLogLite data roots");
 
   std::wstring clear_root = JoinPath(base, L"clear_live");
   SeedDataSet(clear_root, L"clear");
@@ -427,6 +522,7 @@ int wmain() {
   TestCategories();
   TestDayRoundtripAndValidation();
   TestLegacyLoadCompatibility();
+  TestMalformedDataTolerance();
   TestTasksAndReports();
   TestDemoGeneration();
   TestDataOps();

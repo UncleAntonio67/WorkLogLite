@@ -287,8 +287,8 @@ DWORD WINAPI CaptureThreadMain(void* param) {
     goto cleanup;
   }
 
-  hr = CoCreateInstance(CLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
-                        IID_IMMDeviceEnumerator, reinterpret_cast<void**>(&enumerator));
+  hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                        __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator));
   if (FAILED(hr)) {
     fail(L"Failed to create the audio device enumerator.");
     goto cleanup;
@@ -304,7 +304,7 @@ DWORD WINAPI CaptureThreadMain(void* param) {
     goto cleanup;
   }
 
-  hr = device->Activate(IID_IAudioClient, CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&client));
+  hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&client));
   if (FAILED(hr)) {
     if (rec->source == AudioRecordSource::MicrophoneCapture) {
       fail(L"Failed to open the default microphone device.");
@@ -331,7 +331,7 @@ DWORD WINAPI CaptureThreadMain(void* param) {
     goto cleanup;
   }
 
-  hr = client->GetService(IID_IAudioCaptureClient, reinterpret_cast<void**>(&capture));
+  hr = client->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void**>(&capture));
   if (FAILED(hr)) {
     fail(L"Failed to get the audio capture service.");
     goto cleanup;

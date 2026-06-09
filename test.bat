@@ -32,6 +32,7 @@ exit /b 1
 
 :build_msvc
 if not exist build mkdir build
+if not exist build\test_obj mkdir build\test_obj
 
 cl ^
   /utf-8 ^
@@ -40,6 +41,7 @@ cl ^
   /DWINVER=0x0601 /D_WIN32_WINNT=0x0601 /D_WIN32_IE=0x0600 ^
   /O2 /MT ^
   /I src ^
+  /Fo:build\test_obj\ ^
   /Fe:build\WorkLogLiteSmokeTests.exe ^
   %SOURCES% ^
   user32.lib gdi32.lib comctl32.lib comdlg32.lib shlwapi.lib ole32.lib shell32.lib crypt32.lib bcrypt.lib

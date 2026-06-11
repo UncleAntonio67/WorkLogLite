@@ -6,6 +6,7 @@
 #include <commdlg.h>
 #include <windowsx.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -13,7 +14,7 @@
 namespace {
 
 struct Op {
-  enum class Type { Pen, Rect };
+  enum class Type { Pen, Rect, Arrow };
   Type type{Type::Pen};
   COLORREF color{RGB(231, 76, 60)};  // red
   int width{3};
@@ -31,6 +32,36 @@ static RECT NormalizeRect(POINT a, POINT b) {
 
 static int RectW(const RECT& r) { return r.right - r.left; }
 static int RectH(const RECT& r) { return r.bottom - r.top; }
+
+static POINT MakePoint(int x, int y) {
+  POINT p{};
+  p.x = x;
+  p.y = y;
+  return p;
+}
+
+static void DrawArrow(HDC dc, POINT a, POINT b) {
+  MoveToEx(dc, a.x, a.y, nullptr);
+  LineTo(dc, b.x, b.y);
+
+  double dx = (double)(b.x - a.x);
+  double dy = (double)(b.y - a.y);
+  double len = std::sqrt(dx * dx + dy * dy);
+  if (len < 1.0) return;
+
+  double ux = dx / len;
+  double uy = dy / len;
+  double head_len = (std::max)(12.0, (std::min)(24.0, len * 0.22));
+  double head_w = head_len * 0.55;
+
+  POINT h1 = MakePoint((int)std::lround(b.x - ux * head_len + uy * head_w), (int)std::lround(b.y - uy * head_len - ux * head_w));
+  POINT h2 = MakePoint((int)std::lround(b.x - ux * head_len - uy * head_w), (int)std::lround(b.y - uy * head_len + ux * head_w));
+
+  MoveToEx(dc, b.x, b.y, nullptr);
+  LineTo(dc, h1.x, h1.y);
+  MoveToEx(dc, b.x, b.y, nullptr);
+  LineTo(dc, h2.x, h2.y);
+}
 
 static std::wstring GetNowStamp() {
   SYSTEMTIME st{};
@@ -259,6 +290,10 @@ static void RebuildCropWork(ScreenshotState* s) {
         RECT r = NormalizeRect(op.pts[0], op.pts[1]);
         Rectangle(ddc, r.left, r.top, r.right, r.bottom);
       }
+    } else if (op.type == Op::Type::Arrow) {
+      if (op.pts.size() >= 2) {
+        DrawArrow(ddc, op.pts[0], op.pts[1]);
+      }
     }
 
     SelectObject(ddc, obr);
@@ -414,16 +449,17 @@ static void SaveAsBmpDialog(HWND hwnd, ScreenshotState* s) {
 static void ShowContextMenu(HWND hwnd, ScreenshotState* s, int x, int y) {
   HMENU m = CreatePopupMenu();
   if (!m) return;
-  AppendMenuW(m, MF_STRING, 1, L"复制到剪贴板 (C/Enter)");
-  AppendMenuW(m, MF_STRING, 2, L"保存为 BMP... (S)");
+  AppendMenuW(m, MF_STRING, 1, L"\u590d\u5236\u5230\u526a\u8d34\u677f (C/Enter)");
+  AppendMenuW(m, MF_STRING, 2, L"\u4fdd\u5b58\u4e3a BMP... (S)");
   AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-  AppendMenuW(m, MF_STRING, 3, L"工具: 画笔 (P)");
-  AppendMenuW(m, MF_STRING, 4, L"工具: 矩形 (R)");
+  AppendMenuW(m, MF_STRING, 3, L"\u5de5\u5177: \u753b\u7b14 (P)");
+  AppendMenuW(m, MF_STRING, 4, L"\u5de5\u5177: \u77e9\u5f62 (R)");
+  AppendMenuW(m, MF_STRING, 8, L"\u5de5\u5177: \u7bad\u5934 (A)");
   AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-  AppendMenuW(m, MF_STRING, 5, L"撤销 (Ctrl+Z)");
-  AppendMenuW(m, MF_STRING, 6, L"清空标记");
+  AppendMenuW(m, MF_STRING, 5, L"\u64a4\u9500 (Ctrl+Z)");
+  AppendMenuW(m, MF_STRING, 6, L"\u6e05\u7a7a\u6807\u8bb0");
   AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-  AppendMenuW(m, MF_STRING, 7, L"取消 (Esc)");
+  AppendMenuW(m, MF_STRING, 7, L"\u53d6\u6d88 (Esc)");
 
   UINT cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, 0, hwnd, nullptr);
   DestroyMenu(m);
@@ -442,6 +478,10 @@ static void ShowContextMenu(HWND hwnd, ScreenshotState* s, int x, int y) {
       break;
     case 4:
       s->tool = Op::Type::Rect;
+      InvalidateRect(hwnd, nullptr, FALSE);
+      break;
+    case 8:
+      s->tool = Op::Type::Arrow;
       InvalidateRect(hwnd, nullptr, FALSE);
       break;
     case 5:
@@ -463,6 +503,7 @@ static void ShowContextMenu(HWND hwnd, ScreenshotState* s, int x, int y) {
       break;
   }
 }
+
 
 static LRESULT CALLBACK ScreenshotWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   auto* s = reinterpret_cast<ScreenshotState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -509,6 +550,11 @@ static LRESULT CALLBACK ScreenshotWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
       }
       if (wParam == 'R') {
         s->tool = Op::Type::Rect;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
+      if (wParam == 'A') {
+        s->tool = Op::Type::Arrow;
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
@@ -565,7 +611,7 @@ static LRESULT CALLBACK ScreenshotWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
               (std::abs(s->current_op.pts.back().x - lp.x) + std::abs(s->current_op.pts.back().y - lp.y) >= 1)) {
             s->current_op.pts.push_back(lp);
           }
-        } else if (s->current_op.type == Op::Type::Rect) {
+        } else if (s->current_op.type == Op::Type::Rect || s->current_op.type == Op::Type::Arrow) {
           if (s->current_op.pts.size() == 1) {
             s->current_op.pts.push_back(lp);
           } else if (s->current_op.pts.size() >= 2) {
@@ -614,7 +660,7 @@ static LRESULT CALLBACK ScreenshotWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
           // Commit op if meaningful.
           bool ok = false;
           if (s->current_op.type == Op::Type::Pen) ok = (s->current_op.pts.size() >= 1);
-          if (s->current_op.type == Op::Type::Rect) ok = (s->current_op.pts.size() >= 2);
+          if (s->current_op.type == Op::Type::Rect || s->current_op.type == Op::Type::Arrow) ok = (s->current_op.pts.size() >= 2);
           if (ok) {
             s->ops.push_back(std::move(s->current_op));
             RebuildCropWork(s);
@@ -663,7 +709,7 @@ static LRESULT CALLBACK ScreenshotWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
         hint.top = 12;
         hint.right = s->vw - 12;
         hint.bottom = s->vh - 12;
-        DrawHintText(dc, hint, L"框选截图区域: 鼠标拖拽。Esc 取消");
+        DrawHintText(dc, hint, L"\u6846\u9009\u622a\u56fe\u533a\u57df: \u9f20\u6807\u62d6\u62fd\u3002Esc \u53d6\u6d88");
       } else if (s->mode == ScreenshotState::Mode::Editing && s->has_sel) {
         // Draw crop work over the original region.
         if (s->crop_work) {
@@ -689,9 +735,11 @@ static LRESULT CALLBACK ScreenshotWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
         hint.right = s->vw - 12;
         hint.bottom = s->vh - 12;
 
-        const wchar_t* tool = (s->tool == Op::Type::Pen) ? L"画笔" : L"矩形";
+        const wchar_t* tool = L"\u753b\u7b14";
+        if (s->tool == Op::Type::Rect) tool = L"\u77e9\u5f62";
+        if (s->tool == Op::Type::Arrow) tool = L"\u7bad\u5934";
         wchar_t text[256]{};
-        wsprintfW(text, L"标记模式(%s): 左键绘制, 右键菜单。P画笔 R矩形 Ctrl+Z撤销 C/Enter复制 S保存 Esc取消", tool);
+        wsprintfW(text, L"\u6807\u8bb0\u6a21\u5f0f(%s): \u5de6\u952e\u7ed8\u5236, \u53f3\u952e\u83dc\u5355\u3002P\u753b\u7b14 R\u77e9\u5f62 A\u7bad\u5934 Ctrl+Z\u64a4\u9500 C/Enter\u590d\u5236 S\u4fdd\u5b58 Esc\u53d6\u6d88", tool);
         DrawHintText(dc, hint, text);
       }
 

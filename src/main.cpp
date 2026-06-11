@@ -25,7 +25,9 @@
 #include <cmath>
 #include <cwctype>
 #include <cstring>
+#include <map>
 #include <sstream>
+#include <set>
 #include <string_view>
 
 #pragma comment(lib, "comctl32.lib")
@@ -48,6 +50,7 @@ enum : UINT {
   IDM_EXPORT_FULL_DATA = 1012,
   IDM_IMPORT_FULL_DATA = 1013,
   IDM_CLEAR_ALL_DATA = 1014,
+  IDM_THEME_MUNG = 1015,
   IDM_PREVIEW_ENTRY = 1020,
   IDM_PREVIEW_DAY = 1021,
   IDM_MANAGE_TASKS = 1030,
@@ -106,6 +109,7 @@ enum : int {
   IDC_BTN_COLOR_PICKER = 2073,
   IDC_BTN_PASTE_PLAIN = 2074,
   IDC_BTN_DATE_SEPARATOR = 2075,
+  IDC_BTN_RECORDINGS_DIR = 2076,
   IDC_STATUS = 2020,
   IDC_CB_STATUS = 2021,
   IDC_LBL_CATEGORY = 2030,
@@ -151,6 +155,7 @@ struct AppState {
   HWND btn_set_materials{};
   HWND btn_record_system{};
   HWND btn_record_mic{};
+  HWND btn_recordings_dir{};
   HWND btn_color_picker{};
   HWND btn_paste_plain{};
   HWND btn_date_separator{};
@@ -187,6 +192,10 @@ struct AppState {
   HWND btn_preview{};
   HWND status{};
   HFONT font{};
+  bool mung_theme{false};
+  HBRUSH brush_window{};
+  HBRUSH brush_panel{};
+  HBRUSH brush_edit{};
 
   SYSTEMTIME selected{};
   DayData day{};
@@ -197,6 +206,7 @@ struct AppState {
   bool ignore_cal_selchange{false};  // avoid repeated prompts when we programmatically revert calendar selection
   bool suppress_dirty_prompt{false};  // avoid re-entrant prompts triggered by programmatic UI updates while saving
   bool suppress_editor_change_tracking{false};  // ignore control notifications during programmatic editor fills
+  bool suppress_list_selection_sync{false};  // ignore list selection notifications during programmatic rebuild/restore
   bool close_in_progress{false};
 
   // Small "toast" messages shown in the status bar (e.g. "copied to clipboard").
@@ -223,6 +233,18 @@ struct AppState {
   std::wstring editor_materials_dir;
 };
 
+struct EditorSnapshot {
+  int editing_index{-1};
+  std::wstring category;
+  std::wstring start_time;
+  std::wstring end_time;
+  int status_sel{0};
+  std::wstring title;
+  std::wstring body_plain;
+  std::string body_rtf_b64;
+  std::wstring materials_dir;
+};
+
 // Forward declarations used by small UI helpers defined early in this file.
 static std::wstring NormalizeNewlinesToCrlf(const std::wstring& s);
 static bool CopyToClipboard(HWND hwnd, const std::wstring& text);
@@ -230,25 +252,37 @@ static bool WriteUtf8File(const std::wstring& path, const std::wstring& content,
 static bool ReadFileUtf8Simple(const std::wstring& path, std::wstring* out, std::wstring* err);
 static bool EditorMatchesDefaultDraft(AppState* s);
 static int CompareDateYmd(const std::wstring& a, const std::wstring& b);
+static bool EntryVisibleOnDate(const Entry& e, const SYSTEMTIME& selected, const SYSTEMTIME* source_date = nullptr);
+static bool LoadVisibleEntriesForDate(const SYSTEMTIME& selected, DayData* out, std::wstring* err);
+static bool SaveEntryToBackingStore(const Entry& e, const SYSTEMTIME& fallback_date, std::wstring* err);
+static bool DeleteEntriesFromBackingStore(const std::vector<Entry>& entries, const SYSTEMTIME& fallback_date, std::wstring* err);
 static std::vector<int> GetSelectedEntryIndices(AppState* s);
 static void RenderMarkdownToRichEdit(HWND rich, HFONT font, const std::wstring& md);
 static void OpenDataDir(AppState* s);
 static std::wstring ParentDirOf(const std::wstring& path);
 static std::wstring JoinPathLoose(const std::wstring& a, const std::wstring& b);
 static std::wstring NormalizeDirForCompare(const std::wstring& path);
+static void ApplyTheme(AppState* s);
+static COLORREF StatusBkColor(EntryStatus st);
 static std::wstring FormatWin32ErrorMessage(DWORD err);
 static bool ReadClipboardText(HWND hwnd, std::wstring* out);
+static std::string RichEditGetRtfBytes(HWND rich);
+static void RichEditSetRtfBytes(HWND rich, const std::string& bytes);
 static std::wstring GetTaskMaterialsDirById(const std::wstring& task_id);
 static std::wstring TaskMaterialsDirResolved(const Task& t);
 static std::wstring GetWorkMaterialsDir(const SYSTEMTIME& date, const std::wstring& entry_id);
 static bool IsNetworkPathForbidden(const std::wstring& path);
+static bool OpenPathInShell(HWND owner, const std::wstring& path, const wchar_t* what);
 static int CompareSystemTimeDateOnly(const SYSTEMTIME& a, const SYSTEMTIME& b);
 static void TaskInitListColumns(HWND list);
 static void ShowUnitCalcWindow(HWND owner);
 static void Layout(AppState* s);
 
 static bool IsEditorTrulyDirty(AppState* s);
+static void ClearEditor(AppState* s, bool allow_blank = false);
 static void SetEditorDirty(AppState* s, bool dirty);
+static void FillEditorFromEntry(AppState* s, const Entry& e, int index);
+static void ApplyBodyZoom(AppState* s);
 static bool IsAudioRecording(AppState* s, AudioRecordSource source);
 static std::wstring FormatElapsedClock(ULONGLONG start_tick, ULONGLONG now);
 static std::wstring GetDateCtrlYmd(HWND hwnd);
@@ -257,6 +291,10 @@ static void SetDateCtrlOrDefault(HWND hwnd, const std::wstring& ymd, const SYSTE
 
 static void OpenMaterialsDirForEntry(HWND owner, AppState* s, const Entry& e);
 static void EnsureMaterialsDirForEntry(AppState* s, const Entry& e);
+static EditorSnapshot CaptureEditorSnapshot(AppState* s);
+static void RestoreEditorSnapshot(AppState* s, const EditorSnapshot& snap, bool mark_clean);
+static void UpdateStatusBar(AppState* s);
+static bool AutoSaveCurrent(AppState* s);
 
 static UINT QueryDpiForWindowCompat(HWND hwnd) {
   HMODULE user32 = GetModuleHandleW(L"user32.dll");
@@ -420,6 +458,57 @@ static std::wstring GetWindowTextWString(HWND hwnd) {
 
 static void SetEditText(HWND hwnd, const std::wstring& s) {
   SetWindowTextW(hwnd, s.c_str());
+}
+
+static EditorSnapshot CaptureEditorSnapshot(AppState* s) {
+  EditorSnapshot snap{};
+  if (!s) return snap;
+  snap.editing_index = s->editing_index;
+  snap.category = GetWindowTextWString(s->cb_category);
+  snap.start_time = GetDateCtrlYmd(s->ed_start);
+  snap.end_time = GetDateCtrlYmd(s->ed_end);
+  snap.status_sel = s->cb_status ? (int)SendMessageW(s->cb_status, CB_GETCURSEL, 0, 0) : 0;
+  snap.title = GetWindowTextWString(s->ed_title);
+  snap.body_plain = GetWindowTextWString(s->ed_body);
+  if (s->ed_body && !snap.body_plain.empty()) {
+    std::string rtf = RichEditGetRtfBytes(s->ed_body);
+    if (!rtf.empty()) snap.body_rtf_b64 = Base64Encode(rtf);
+  }
+  snap.materials_dir = s->editor_materials_dir;
+  return snap;
+}
+
+static void RestoreEditorSnapshot(AppState* s, const EditorSnapshot& snap, bool mark_clean) {
+  if (!s) return;
+  s->suppress_editor_change_tracking = true;
+  SetWindowTextW(s->cb_category, snap.category.c_str());
+  SetDateCtrlOrDefault(s->ed_start, snap.start_time, s->selected);
+  SetDateCtrlOrDefault(s->ed_end, snap.end_time, AddDays(s->selected, 1));
+  if (s->cb_status) {
+    SendMessageW(s->cb_status, CB_SETCURSEL, snap.status_sel, 0);
+    EnableWindow(s->cb_status, TRUE);
+  }
+  SetEditText(s->ed_title, snap.title);
+  if (!snap.body_rtf_b64.empty()) {
+    std::string rtf;
+    if (Base64Decode(snap.body_rtf_b64, &rtf)) {
+      RichEditSetRtfBytes(s->ed_body, rtf);
+    } else {
+      SetEditText(s->ed_body, snap.body_plain);
+    }
+  } else {
+    SetEditText(s->ed_body, snap.body_plain);
+  }
+  ApplyBodyZoom(s);
+  s->editor_materials_dir = snap.materials_dir;
+  s->editing_index = snap.editing_index;
+  if (mark_clean) {
+    if (s->ed_title) SendMessageW(s->ed_title, EM_SETMODIFY, FALSE, 0);
+    if (s->ed_body) SendMessageW(s->ed_body, EM_SETMODIFY, FALSE, 0);
+    SetEditorDirty(s, false);
+  }
+  s->suppress_editor_change_tracking = false;
+  UpdateStatusBar(s);
 }
 
 static void RefreshCategoryCombo(AppState* s) {
@@ -995,7 +1084,7 @@ static void FinishAudioRecording(AppState* s, AudioRecordSource source) {
   if (!PromptSaveRecordedAudio(s->hwnd, source, temp_path, &save_path, &cancelled, &save_err)) {
     if (cancelled) {
       std::wstring folder = ParentDirOf(temp_path);
-      if (!folder.empty()) ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+      if (!folder.empty()) OpenPathInShell(s->hwnd, folder, L"录音目录");
       ShowToast(s, std::wstring(AudioSourceCn(source)) + L"录音已保留到默认目录");
       return;
     }
@@ -1010,8 +1099,8 @@ static void FinishAudioRecording(AppState* s, AudioRecordSource source) {
   }
 
   std::wstring folder = ParentDirOf(save_path);
-  if (!folder.empty()) ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-  ShellExecuteW(nullptr, L"open", save_path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  if (!folder.empty()) OpenPathInShell(s->hwnd, folder, L"录音目录");
+  (void)OpenPathInShell(s->hwnd, save_path, L"录音文件");
   ShowToast(s, std::wstring(AudioSourceCn(source)) + L"录音已保存");
 }
 
@@ -1064,13 +1153,16 @@ static void DrawOfficeButton(AppState* s, const DRAWITEMSTRUCT* di) {
   bool recording = s && ((control_id == IDC_BTN_RECORD_SYSTEM && IsAudioRecording(s, AudioRecordSource::SystemLoopback)) ||
                          (control_id == IDC_BTN_RECORD_MIC && IsAudioRecording(s, AudioRecordSource::MicrophoneCapture)));
 
-  COLORREF bg = disabled ? RGB(245, 245, 245)
+  bool mung = s && s->mung_theme;
+  COLORREF bg = disabled ? (mung ? RGB(224, 231, 217) : RGB(245, 245, 245))
                          : (recording ? (pressed ? RGB(252, 226, 226) : RGB(255, 241, 241))
-                                      : (pressed ? RGB(225, 240, 255) : RGB(248, 249, 251)));
-  COLORREF border = disabled ? RGB(215, 215, 215)
+                                      : (mung ? (pressed ? RGB(202, 217, 192) : RGB(217, 228, 208))
+                                              : (pressed ? RGB(225, 240, 255) : RGB(248, 249, 251))));
+  COLORREF border = disabled ? (mung ? RGB(170, 182, 160) : RGB(215, 215, 215))
                              : (recording ? (pressed ? RGB(196, 46, 46) : RGB(220, 80, 80))
-                                          : (pressed ? RGB(0, 120, 215) : RGB(206, 210, 216)));
-  COLORREF text = disabled ? RGB(150, 150, 150) : (recording ? RGB(130, 18, 18) : RGB(25, 25, 25));
+                                          : (mung ? (pressed ? RGB(108, 133, 96) : RGB(132, 152, 122))
+                                                  : (pressed ? RGB(0, 120, 215) : RGB(206, 210, 216))));
+  COLORREF text = disabled ? RGB(150, 150, 150) : (recording ? RGB(130, 18, 18) : (mung ? RGB(46, 62, 41) : RGB(25, 25, 25)));
 
   // Outer rounded rect.
   HBRUSH br = CreateSolidBrush(bg);
@@ -1116,6 +1208,71 @@ static void DrawOfficeButton(AppState* s, const DRAWITEMSTRUCT* di) {
   SelectObject(dc, ob);
   DeleteObject(pen);
   DeleteObject(br);
+}
+
+static COLORREF ThemeWindowColor(const AppState* s) {
+  return (s && s->mung_theme) ? RGB(228, 236, 218) : GetSysColor(COLOR_WINDOW);
+}
+
+static COLORREF ThemePanelColor(const AppState* s) {
+  return (s && s->mung_theme) ? RGB(217, 228, 208) : GetSysColor(COLOR_BTNFACE);
+}
+
+static COLORREF ThemeEditColor(const AppState* s) {
+  return (s && s->mung_theme) ? RGB(238, 244, 232) : GetSysColor(COLOR_WINDOW);
+}
+
+static COLORREF ThemeTextColor(const AppState* s) {
+  return (s && s->mung_theme) ? RGB(46, 62, 41) : RGB(20, 20, 20);
+}
+
+static void RecreateThemeBrushes(AppState* s) {
+  if (!s) return;
+  if (s->brush_window) DeleteObject(s->brush_window);
+  if (s->brush_panel) DeleteObject(s->brush_panel);
+  if (s->brush_edit) DeleteObject(s->brush_edit);
+  s->brush_window = CreateSolidBrush(ThemeWindowColor(s));
+  s->brush_panel = CreateSolidBrush(ThemePanelColor(s));
+  s->brush_edit = CreateSolidBrush(ThemeEditColor(s));
+}
+
+static COLORREF ThemedStatusBkColor(AppState* s, EntryStatus st) {
+  if (!s || !s->mung_theme) return StatusBkColor(st);
+  switch (st) {
+    case EntryStatus::Todo: return RGB(230, 238, 223);
+    case EntryStatus::Doing: return RGB(220, 232, 212);
+    case EntryStatus::Blocked: return RGB(236, 233, 216);
+    case EntryStatus::Done: return RGB(214, 232, 208);
+    case EntryStatus::None:
+    default: return ThemeEditColor(s);
+  }
+}
+
+static void UpdateThemeMenuState(AppState* s) {
+  if (!s || !s->hwnd) return;
+  HMENU menu = GetMenu(s->hwnd);
+  if (!menu) return;
+  CheckMenuItem(menu, IDM_THEME_MUNG, MF_BYCOMMAND | (s->mung_theme ? MF_CHECKED : MF_UNCHECKED));
+  DrawMenuBar(s->hwnd);
+}
+
+static void ApplyTheme(AppState* s) {
+  if (!s) return;
+  RecreateThemeBrushes(s);
+
+  if (s->list) {
+    ListView_SetBkColor(s->list, ThemeEditColor(s));
+    ListView_SetTextBkColor(s->list, ThemeEditColor(s));
+    ListView_SetTextColor(s->list, ThemeTextColor(s));
+  }
+  if (s->ed_body) SendMessageW(s->ed_body, EM_SETBKGNDCOLOR, 0, ThemeEditColor(s));
+  if (s->status) SendMessageW(s->status, SB_SETBKCOLOR, 0, ThemePanelColor(s));
+
+  UpdateThemeMenuState(s);
+  InvalidateRect(s->hwnd, nullptr, TRUE);
+  if (s->list) InvalidateRect(s->list, nullptr, TRUE);
+  if (s->ed_body) InvalidateRect(s->ed_body, nullptr, TRUE);
+  if (s->status) InvalidateRect(s->status, nullptr, TRUE);
 }
 
 static void UpdateFocusTimerButton(AppState* s) {
@@ -1387,7 +1544,11 @@ static void InsertDateSeparatorIntoBody(AppState* s) {
 static void PickBodyTextColor(AppState* s) {
   if (!s) return;
   COLORREF color = RGB(0, 0, 0);
-  if (!PickScreenColor(s->hwnd, &color)) return;
+  std::wstring err;
+  if (!PickScreenColor(s->hwnd, &color, &err)) {
+    if (!err.empty()) ShowInfoBox(s->hwnd, err.c_str(), L"取色器");
+    return;
+  }
   wchar_t buf[16]{};
   wsprintfW(buf, L"#%02X%02X%02X", GetRValue(color), GetGValue(color), GetBValue(color));
   CopyToClipboard(s->hwnd, buf);
@@ -1762,6 +1923,15 @@ static LRESULT CALLBACK UnitCalcWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
       MoveWindow(s->btn_copy, bx, y, btn_w, btn_h, TRUE);
       return 0;
     }
+    case WM_GETMINMAXINFO: {
+      auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+      if (!mmi) return 0;
+      RECT rc{0, 0, 700, 520};
+      AdjustWindowRectEx(&rc, WS_OVERLAPPEDWINDOW, FALSE, WS_EX_DLGMODALFRAME);
+      mmi->ptMinTrackSize.x = rc.right - rc.left;
+      mmi->ptMinTrackSize.y = rc.bottom - rc.top;
+      return 0;
+    }
     case WM_COMMAND: {
       int id = LOWORD(wParam);
       int code = HIWORD(wParam);
@@ -1813,7 +1983,7 @@ static void ShowUnitCalcWindow(HWND owner) {
   UnitCalcWindowState state{};
   HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, wc.lpszClassName, L"单位计算与带宽需求",
                               WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 560, 430,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 760, 560,
                               owner, nullptr, wc.hInstance, &state);
   if (!hwnd) {
     ShowLastErrorBox(owner, L"CreateWindowEx(UnitCalc)");
@@ -1907,7 +2077,7 @@ static void UpdateStatusParts(AppState* s) {
 
 static const wchar_t* StatusToCN(EntryStatus st) {
   switch (st) {
-    case EntryStatus::Todo: return L"未开始";
+    case EntryStatus::Todo: return L"无";
     case EntryStatus::Doing: return L"进行中";
     case EntryStatus::Blocked: return L"阻塞";
     case EntryStatus::Done: return L"已完成";
@@ -1918,20 +2088,19 @@ static const wchar_t* StatusToCN(EntryStatus st) {
 
 static EntryStatus StatusFromComboSel(int idx) {
   switch (idx) {
-    case 1: return EntryStatus::Todo;
-    case 2: return EntryStatus::Doing;
-    case 3: return EntryStatus::Blocked;
-    case 4: return EntryStatus::Done;
+    case 1: return EntryStatus::Doing;
+    case 2: return EntryStatus::Blocked;
+    case 3: return EntryStatus::Done;
     default: return EntryStatus::None;
   }
 }
 
 static int ComboSelFromStatus(EntryStatus st) {
   switch (st) {
-    case EntryStatus::Todo: return 1;
-    case EntryStatus::Doing: return 2;
-    case EntryStatus::Blocked: return 3;
-    case EntryStatus::Done: return 4;
+    case EntryStatus::Todo: return 0;
+    case EntryStatus::Doing: return 1;
+    case EntryStatus::Blocked: return 2;
+    case EntryStatus::Done: return 3;
     case EntryStatus::None:
     default: return 0;
   }
@@ -1985,6 +2154,14 @@ static void SetEditorDirty(AppState* s, bool dirty) {
     KillTimer(s->hwnd, s->autosave_timer_id);
     s->autosave_timer_id = 0;
   }
+}
+
+static Task* FindTaskByIdIn(std::vector<Task>* tasks, const std::wstring& id) {
+  if (!tasks) return nullptr;
+  for (auto& t : *tasks) {
+    if (t.id == id) return &t;
+  }
+  return nullptr;
 }
 
 static bool EditorHasMeaningfulContent(AppState* s) {
@@ -2043,8 +2220,19 @@ static bool IsEditorTrulyDirty(AppState* s) {
   return !EditorMatchesDefaultDraft(s);
 }
 
-static void ClearEditor(AppState* s) {
+static void ClearEditor(AppState* s, bool allow_blank) {
   if (!s) return;
+  if (!allow_blank) {
+    int sel = s->list ? ListView_GetNextItem(s->list, -1, LVNI_SELECTED) : -1;
+    if (sel >= 0 && sel < (int)s->day.entries.size()) {
+      FillEditorFromEntry(s, s->day.entries[(size_t)sel], sel);
+      return;
+    }
+    if (s->editing_index >= 0 && s->editing_index < (int)s->day.entries.size()) {
+      FillEditorFromEntry(s, s->day.entries[(size_t)s->editing_index], s->editing_index);
+      return;
+    }
+  }
   s->suppress_editor_change_tracking = true;
   if (!s->categories.empty()) SetWindowTextW(s->cb_category, s->categories[0].c_str());
   else SetWindowTextW(s->cb_category, L"");
@@ -2054,6 +2242,7 @@ static void ClearEditor(AppState* s) {
   if (s->cb_status) SendMessageW(s->cb_status, CB_SETCURSEL, 0, 0);
   SetEditText(s->ed_title, L"");
   SetEditText(s->ed_body, L"");
+  ApplyBodyZoom(s);
   s->editor_materials_dir.clear();
   if (s->ed_title) SendMessageW(s->ed_title, EM_SETMODIFY, FALSE, 0);
   if (s->ed_body) SendMessageW(s->ed_body, EM_SETMODIFY, FALSE, 0);
@@ -2071,8 +2260,17 @@ static void FillEditorFromEntry(AppState* s, const Entry& e, int index) {
   s->suppress_editor_change_tracking = true;
   bool is_task = EntryIsTaskProgress(e);
   SetWindowTextW(s->cb_category, e.category.c_str());
-  SetDateCtrlOrDefault(s->ed_start, e.start_time, s->selected);
-  SetDateCtrlOrDefault(s->ed_end, e.end_time, AddDays(s->selected, 1));
+  std::wstring start_ymd = e.start_time;
+  std::wstring end_ymd = e.end_time;
+  if (is_task && !e.task_id.empty()) {
+    Task* t = FindTaskById(s, e.task_id);
+    if (t) {
+      start_ymd = FormatDateYYYYMMDD(t->start);
+      end_ymd = FormatDateYYYYMMDD(AddDays(t->end, 1));
+    }
+  }
+  SetDateCtrlOrDefault(s->ed_start, start_ymd, s->selected);
+  SetDateCtrlOrDefault(s->ed_end, end_ymd, AddDays(s->selected, 1));
   if (s->cb_status) {
     SendMessageW(s->cb_status, CB_SETCURSEL, ComboSelFromStatus(EffectiveStatus(s, e)), 0);
     EnableWindow(s->cb_status, TRUE);
@@ -2082,11 +2280,14 @@ static void FillEditorFromEntry(AppState* s, const Entry& e, int index) {
     std::string rtf;
     if (Base64Decode(e.body_rtf_b64, &rtf)) {
       RichEditSetRtfBytes(s->ed_body, rtf);
+      ApplyBodyZoom(s);
     } else {
       SetEditText(s->ed_body, e.body_plain);
+      ApplyBodyZoom(s);
     }
   } else {
     SetEditText(s->ed_body, e.body_plain);
+    ApplyBodyZoom(s);
   }
 
   // Materials dir is always editable even if task progress is read-only in other fields.
@@ -2122,6 +2323,19 @@ static std::wstring EntryMaterialsDirText(AppState* s, const Entry& e) {
   if (!e.materials_dir.empty()) return e.materials_dir;
   if (!e.id.empty()) return GetWorkMaterialsDir(s->selected, e.id);
   return L"";
+}
+
+static void UpdateListRowForEntry(AppState* s, int index) {
+  if (!s || !s->list) return;
+  if (index < 0 || index >= (int)s->day.entries.size()) return;
+  const auto& e = s->day.entries[(size_t)index];
+  ListView_SetItemText(s->list, index, 0, const_cast<wchar_t*>(TimeRangeText(e).c_str()));
+  ListView_SetItemText(s->list, index, 1, const_cast<wchar_t*>(e.category.c_str()));
+  ListView_SetItemText(s->list, index, 2, const_cast<wchar_t*>(e.title.c_str()));
+  EntryStatus st = EffectiveStatus(s, e);
+  ListView_SetItemText(s->list, index, 3, const_cast<wchar_t*>(StatusToCN(st)));
+  std::wstring dir = EntryMaterialsDirText(s, e);
+  ListView_SetItemText(s->list, index, 4, const_cast<wchar_t*>(dir.c_str()));
 }
 
 static int CompareTextNoCase(const std::wstring& a, const std::wstring& b) {
@@ -2199,6 +2413,7 @@ static void SortDayEntries(AppState* s) {
 }
 
 static void RefreshList(AppState* s) {
+  if (!s || !s->list) return;
   int prev_sel = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
   std::wstring prev_id;
   if (prev_sel >= 0 && prev_sel < (int)s->day.entries.size()) {
@@ -2207,6 +2422,7 @@ static void RefreshList(AppState* s) {
 
   SortDayEntries(s);
 
+  s->suppress_list_selection_sync = true;
   ListView_DeleteAllItems(s->list);
 
   for (int i = 0; i < (int)s->day.entries.size(); i++) {
@@ -2242,14 +2458,21 @@ static void RefreshList(AppState* s) {
     ListView_SetItemState(s->list, restore_index, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
     ListView_EnsureVisible(s->list, restore_index, FALSE);
   }
+  s->suppress_list_selection_sync = false;
 
   UpdateDayHeader(s);
 }
 
 static bool LoadSelectedDay(AppState* s, const SYSTEMTIME& date) {
+  std::wstring restore_entry_id;
+  bool same_day_reload = CompareSystemTimeDateOnly(s->selected, date) == 0;
+  if (same_day_reload && s->editing_index >= 0 && s->editing_index < (int)s->day.entries.size()) {
+    restore_entry_id = s->day.entries[(size_t)s->editing_index].id;
+  }
+
   DayData dd{};
   std::wstring err;
-  if (!LoadDayFile(date, &dd, &err)) {
+  if (!LoadVisibleEntriesForDate(date, &dd, &err)) {
     ShowInfoBox(s->hwnd, err.c_str(), L"读取失败");
     return false;
   }
@@ -2278,6 +2501,8 @@ static bool LoadSelectedDay(AppState* s, const SYSTEMTIME& date) {
       e.task_id = t.id;
       e.category = t.category;
       e.title = t.title;
+      e.start_time = FormatDateYYYYMMDD(t.start);
+      e.end_time = FormatDateYYYYMMDD(AddDays(t.end, 1));
       e.status = EntryStatus::None;  // use task's status as effective status
       s->day.entries.push_back(std::move(e));
     }
@@ -2293,7 +2518,20 @@ static bool LoadSelectedDay(AppState* s, const SYSTEMTIME& date) {
   RefreshCategoryCombo(s);
 
   RefreshList(s);
-  ClearEditor(s);
+  if (!restore_entry_id.empty()) {
+    for (int i = 0; i < (int)s->day.entries.size(); ++i) {
+      if (s->day.entries[(size_t)i].id == restore_entry_id) {
+        s->editing_index = i;
+        ListView_SetItemState(s->list, i, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_EnsureVisible(s->list, i, FALSE);
+        FillEditorFromEntry(s, s->day.entries[(size_t)i], i);
+        UpdateDayHeader(s);
+        UpdateStatusBar(s);
+        return true;
+      }
+    }
+  }
+  ClearEditor(s, true);
   UpdateDayHeader(s);
   UpdateStatusBar(s);
   return true;
@@ -2307,6 +2545,207 @@ static int CompareDateYmd(const std::wstring& a, const std::wstring& b) {
   if (sa.wMonth != sb.wMonth) return sa.wMonth < sb.wMonth ? -1 : 1;
   if (sa.wDay != sb.wDay) return sa.wDay < sb.wDay ? -1 : 1;
   return 0;
+}
+
+static bool ResolveEntrySourceDate(const Entry& e, const SYSTEMTIME& fallback_date, SYSTEMTIME* out) {
+  if (!out) return false;
+  if (!e.source_day_ymd.empty() && ParseYYYYMMDD(e.source_day_ymd, out)) return true;
+  *out = fallback_date;
+  return true;
+}
+
+static bool EndsWithI(const std::wstring& s, const std::wstring& suffix) {
+  if (s.size() < suffix.size()) return false;
+  size_t off = s.size() - suffix.size();
+  for (size_t i = 0; i < suffix.size(); ++i) {
+    if (towlower(s[off + i]) != towlower(suffix[i])) return false;
+  }
+  return true;
+}
+
+static bool EntryVisibleOnDate(const Entry& e, const SYSTEMTIME& selected, const SYSTEMTIME* source_date) {
+  std::wstring selected_ymd = FormatDateYYYYMMDD(selected);
+  SYSTEMTIME start{};
+  SYSTEMTIME end{};
+  if (!e.start_time.empty() && !e.end_time.empty() && ParseYYYYMMDD(e.start_time, &start) && ParseYYYYMMDD(e.end_time, &end)) {
+    return CompareDateYmd(e.start_time, selected_ymd) <= 0 && CompareDateYmd(selected_ymd, e.end_time) < 0;
+  }
+
+  SYSTEMTIME source{};
+  if (source_date) {
+    source = *source_date;
+    return CompareSystemTimeDateOnly(source, selected) == 0;
+  }
+  if (ResolveEntrySourceDate(e, selected, &source)) {
+    return CompareSystemTimeDateOnly(source, selected) == 0;
+  }
+  return false;
+}
+
+static bool EnumerateStoredDayDates(std::vector<SYSTEMTIME>* out, std::wstring* err) {
+  if (!out) return false;
+  out->clear();
+
+  std::set<std::wstring> seen;
+  std::wstring root = GetDataRootDir();
+  WIN32_FIND_DATAW yfd{};
+  HANDLE hy = FindFirstFileW(JoinPathLoose(root, L"*").c_str(), &yfd);
+  if (hy == INVALID_HANDLE_VALUE) return true;
+
+  do {
+    if (!(yfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+    std::wstring year = yfd.cFileName;
+    if (year == L"." || year == L"..") continue;
+    if (year.size() != 4 || year.find_first_not_of(L"0123456789") != std::wstring::npos) continue;
+
+    std::wstring year_dir = JoinPathLoose(root, year);
+    WIN32_FIND_DATAW mfd{};
+    HANDLE hm = FindFirstFileW(JoinPathLoose(year_dir, L"*").c_str(), &mfd);
+    if (hm == INVALID_HANDLE_VALUE) continue;
+    do {
+      if (!(mfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+      std::wstring month = mfd.cFileName;
+      if (month == L"." || month == L"..") continue;
+      if (month.size() != 2 || month.find_first_not_of(L"0123456789") != std::wstring::npos) continue;
+
+      std::wstring month_dir = JoinPathLoose(year_dir, month);
+      WIN32_FIND_DATAW ffd{};
+      HANDLE hf = FindFirstFileW(JoinPathLoose(month_dir, L"*").c_str(), &ffd);
+      if (hf == INVALID_HANDLE_VALUE) continue;
+      do {
+        if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        std::wstring name = ffd.cFileName;
+        if (name.size() != 14 && name.size() != 15) continue;
+        if (!(EndsWithI(name, L".wlr") || EndsWithI(name, L".wlmd"))) continue;
+        std::wstring ymd = name.substr(0, 10);
+        if (!seen.insert(ymd).second) continue;
+        SYSTEMTIME st{};
+        if (!ParseYYYYMMDD(ymd, &st)) continue;
+        out->push_back(st);
+      } while (FindNextFileW(hf, &ffd));
+      FindClose(hf);
+    } while (FindNextFileW(hm, &mfd));
+    FindClose(hm);
+  } while (FindNextFileW(hy, &yfd));
+  FindClose(hy);
+
+  std::sort(out->begin(), out->end(), [](const SYSTEMTIME& a, const SYSTEMTIME& b) {
+    return CompareSystemTimeDateOnly(a, b) < 0;
+  });
+  return true;
+}
+
+static bool LoadVisibleEntriesForDate(const SYSTEMTIME& selected, DayData* out, std::wstring* err) {
+  if (!out) return false;
+  out->date = selected;
+  out->entries.clear();
+
+  std::vector<SYSTEMTIME> stored_dates;
+  if (!EnumerateStoredDayDates(&stored_dates, err)) return false;
+  for (const auto& source_date : stored_dates) {
+    DayData day{};
+    std::wstring load_err;
+    if (!LoadDayFile(source_date, &day, &load_err)) {
+      if (err) *err = load_err;
+      return false;
+    }
+    std::wstring source_ymd = FormatDateYYYYMMDD(source_date);
+    for (auto e : day.entries) {
+      e.source_day_ymd = source_ymd;
+      if (EntryVisibleOnDate(e, selected, &source_date)) {
+        out->entries.push_back(std::move(e));
+      }
+    }
+  }
+  return true;
+}
+
+static bool SaveEntryToBackingStore(const Entry& e, const SYSTEMTIME& fallback_date, std::wstring* err) {
+  SYSTEMTIME source_date{};
+  ResolveEntrySourceDate(e, fallback_date, &source_date);
+
+  DayData stored{};
+  if (!LoadDayFile(source_date, &stored, err)) return false;
+
+  Entry persisted = e;
+  persisted.source_day_ymd.clear();
+  bool found = false;
+  for (auto& existing : stored.entries) {
+    if (existing.id == persisted.id) {
+      existing = persisted;
+      found = true;
+      break;
+    }
+  }
+  if (!found) stored.entries.push_back(std::move(persisted));
+  stored.date = source_date;
+  return SaveDayFile(stored, err);
+}
+
+static bool DeleteEntriesFromBackingStore(const std::vector<Entry>& entries, const SYSTEMTIME& fallback_date, std::wstring* err) {
+  std::map<std::wstring, std::vector<std::wstring>> ids_by_day;
+  std::map<std::wstring, DayData> original_days;
+  std::vector<std::wstring> commit_order;
+
+  for (const auto& e : entries) {
+    if (e.placeholder && e.source_day_ymd.empty()) continue;
+    SYSTEMTIME source_date{};
+    ResolveEntrySourceDate(e, fallback_date, &source_date);
+    std::wstring source_ymd = FormatDateYYYYMMDD(source_date);
+    ids_by_day[source_ymd].push_back(e.id);
+  }
+
+  for (const auto& kv : ids_by_day) {
+    SYSTEMTIME source_date{};
+    if (!ParseYYYYMMDD(kv.first, &source_date)) continue;
+    DayData day{};
+    if (!LoadDayFile(source_date, &day, err)) {
+      for (auto it = commit_order.rbegin(); it != commit_order.rend(); ++it) {
+        std::wstring rollback_err;
+        (void)SaveDayFile(original_days[*it], &rollback_err);
+      }
+      return false;
+    }
+    original_days[kv.first] = day;
+    auto& ids = kv.second;
+    day.entries.erase(std::remove_if(day.entries.begin(), day.entries.end(), [&](const Entry& item) {
+                      return std::find(ids.begin(), ids.end(), item.id) != ids.end();
+                    }),
+                    day.entries.end());
+
+    bool ok = true;
+    if (!day.entries.empty()) {
+      ok = SaveDayFile(day, err);
+    } else {
+      std::wstring wlr_path = GetDayFilePath(source_date);
+      std::wstring wlmd_path = JoinPathLoose(ParentDirOf(wlr_path), FormatDateYYYYMMDD(source_date) + L".wlmd");
+      BOOL del_wlr = DeleteFileW(wlr_path.c_str());
+      DWORD le_wlr = del_wlr ? ERROR_SUCCESS : GetLastError();
+      BOOL del_wlmd = DeleteFileW(wlmd_path.c_str());
+      DWORD le_wlmd = del_wlmd ? ERROR_SUCCESS : GetLastError();
+      ok = ((del_wlr || le_wlr == ERROR_FILE_NOT_FOUND || le_wlr == ERROR_PATH_NOT_FOUND) &&
+            (del_wlmd || le_wlmd == ERROR_FILE_NOT_FOUND || le_wlmd == ERROR_PATH_NOT_FOUND));
+      if (!ok && err) {
+        *err = L"删除日记录文件失败：\n" + wlr_path + L"\n\n" + FormatWin32ErrorMessage(
+          (le_wlr != ERROR_SUCCESS && le_wlr != ERROR_FILE_NOT_FOUND && le_wlr != ERROR_PATH_NOT_FOUND) ? le_wlr : le_wlmd);
+      }
+    }
+
+    if (!ok) {
+      auto restore_current = original_days.find(kv.first);
+      if (restore_current != original_days.end()) {
+        std::wstring rollback_err;
+        (void)SaveDayFile(restore_current->second, &rollback_err);
+      }
+      for (auto it = commit_order.rbegin(); it != commit_order.rend(); ++it) {
+        std::wstring rollback_err;
+        (void)SaveDayFile(original_days[*it], &rollback_err);
+      }
+      return false;
+    }
+    commit_order.push_back(kv.first);
+  }
+  return true;
 }
 
 static bool SaveEditorToModel(AppState* s, bool* out_changed) {
@@ -2340,6 +2779,8 @@ static bool SaveEditorToModel(AppState* s, bool* out_changed) {
     EntryStatus chosen = StatusFromComboSel(idx);
     Task* t = FindTaskById(s, e.task_id);
     if (t) {
+      e.start_time = FormatDateYYYYMMDD(t->start);
+      e.end_time = FormatDateYYYYMMDD(AddDays(t->end, 1));
       if (t->status != chosen) {
         t->status = chosen;
         task_status_changed = true;
@@ -2395,7 +2836,10 @@ static bool SaveEditorToModel(AppState* s, bool* out_changed) {
 
   bool has_any = false;
   if (EntryIsTaskProgress(e)) {
-    has_any = !e.body_plain.empty() || !e.start_time.empty() || !e.end_time.empty();
+    // Task progress placeholders are injected into the day view. Autosave should not
+    // materialize them as persisted daily records unless the user actually wrote progress.
+    // Task title/category/status are task-level data and are saved separately to tasks.wlt.
+    has_any = !e.body_plain.empty() || !e.body_rtf_b64.empty();
   } else {
     has_any = !e.title.empty() || !e.body_plain.empty() || e.status != EntryStatus::None || !e.materials_dir.empty();
   }
@@ -2405,7 +2849,6 @@ static bool SaveEditorToModel(AppState* s, bool* out_changed) {
     if (task_status_changed || task_meta_changed) {
       std::wstring terr;
       SaveTasks(s->tasks, &terr);
-      RefreshList(s);
     }
     return true;
   }
@@ -2422,6 +2865,7 @@ static bool SaveEditorToModel(AppState* s, bool* out_changed) {
                 (int)st.wYear, (int)st.wMonth, (int)st.wDay, (int)st.wHour, (int)st.wMinute, (int)st.wSecond);
       e.id = buf;
     }
+    e.source_day_ymd = FormatDateYYYYMMDD(s->selected);
     s->day.entries.push_back(e);
     s->editing_index = (int)s->day.entries.size() - 1;
   }
@@ -2429,35 +2873,36 @@ static bool SaveEditorToModel(AppState* s, bool* out_changed) {
 
   // Once user saves, this entry should persist.
   s->day.entries[(size_t)s->editing_index].placeholder = false;
+  if (s->day.entries[(size_t)s->editing_index].source_day_ymd.empty()) {
+    s->day.entries[(size_t)s->editing_index].source_day_ymd = FormatDateYYYYMMDD(s->selected);
+  }
   EnsureMaterialsDirForEntry(s, s->day.entries[(size_t)s->editing_index]);
 
   // Add category to list if new, and persist categories best-effort.
   if (!CategoriesContains(s->categories, e.category)) {
-    s->categories.push_back(e.category);
-    NormalizeCategories(&s->categories);
-    RefreshCategoryCombo(s);
+    std::vector<std::wstring> new_categories = s->categories;
+    new_categories.push_back(e.category);
+    NormalizeCategories(&new_categories);
     std::wstring cat_err;
-    SaveCategories(s->categories, &cat_err);
+    if (!SaveCategories(new_categories, &cat_err)) {
+      ShowInfoBox(s->hwnd, cat_err.c_str(), L"保存分类失败");
+      return false;
+    }
+    s->categories = std::move(new_categories);
+    RefreshCategoryCombo(s);
   }
 
   if (task_status_changed || task_meta_changed) {
     std::wstring terr;
-    SaveTasks(s->tasks, &terr);
-    RefreshList(s);
+    if (!SaveTasks(s->tasks, &terr)) {
+      ShowInfoBox(s->hwnd, terr.c_str(), L"保存任务失败");
+      return false;
+    }
   }
   return true;
 }
 
-static bool PersistDay(AppState* s) {
-  std::wstring err;
-  if (!SaveDayFile(s->day, &err)) {
-    ShowInfoBox(s->hwnd, err.c_str(), L"保存失败");
-    return false;
-  }
-  return true;
-}
-
-static bool SaveCurrent(AppState* s) {
+static bool SaveCurrent(AppState* s, bool rebuild_list = true) {
   // Saving can trigger programmatic list refresh/selection changes which would otherwise re-enter
   // PromptSaveIfDirty and create a prompt loop. Suppress prompts during the save operation.
   struct Guard {
@@ -2478,20 +2923,141 @@ static bool SaveCurrent(AppState* s) {
     UpdateStatusBar(s);
     return true;
   }
-  if (!PersistDay(s)) return false;
+  std::wstring err;
+  if (s->editing_index < 0 || s->editing_index >= (int)s->day.entries.size()) return false;
+  if (!SaveEntryToBackingStore(s->day.entries[(size_t)s->editing_index], s->selected, &err)) {
+    ShowInfoBox(s->hwnd, err.c_str(), L"保存失败");
+    return false;
+  }
 
   // Clear dirty flags before any UI churn (RefreshList/selection changes) to avoid prompt loops.
   SetEditorDirty(s, false);
   if (s->ed_title) SendMessageW(s->ed_title, EM_SETMODIFY, FALSE, 0);
   if (s->ed_body) SendMessageW(s->ed_body, EM_SETMODIFY, FALSE, 0);
 
-  RefreshList(s);
-  if (s->editing_index >= 0) {
-    ListView_SetItemState(s->list, s->editing_index, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
-    ListView_EnsureVisible(s->list, s->editing_index, FALSE);
+  if (rebuild_list) {
+    (void)LoadSelectedDay(s, s->selected);
+  } else if (s->editing_index >= 0 && s->editing_index < (int)s->day.entries.size()) {
+    UpdateListRowForEntry(s, s->editing_index);
   }
   SetFocus(s->ed_body ? s->ed_body : s->ed_title);
   ShowToast(s, L"已保存");
+  UpdateStatusBar(s);
+  return true;
+}
+
+static bool AutoSaveCurrent(AppState* s) {
+  if (!s) return false;
+  if (s->editing_index < 0 || s->editing_index >= (int)s->day.entries.size()) return false;
+
+  Entry original_entry = s->day.entries[(size_t)s->editing_index];
+  std::vector<Task> tasks_copy = s->tasks;
+  Entry e = original_entry;
+
+  e.category = GetWindowTextWString(s->cb_category);
+  e.start_time = GetDateCtrlYmd(s->ed_start);
+  e.end_time = GetDateCtrlYmd(s->ed_end);
+  e.title = GetWindowTextWString(s->ed_title);
+  e.body_plain = GetWindowTextWString(s->ed_body);
+  if (s->ed_body) {
+    if (!e.body_plain.empty()) {
+      std::string rtf = RichEditGetRtfBytes(s->ed_body);
+      if (!rtf.empty()) e.body_rtf_b64 = Base64Encode(rtf);
+    } else {
+      e.body_rtf_b64.clear();
+    }
+  }
+
+  while (!e.category.empty() && iswspace(e.category.front())) e.category.erase(e.category.begin());
+  while (!e.category.empty() && iswspace(e.category.back())) e.category.pop_back();
+  if (e.category.empty()) return false;
+  if (e.start_time.empty() || e.end_time.empty()) return false;
+  if (CompareDateYmd(e.start_time, e.end_time) >= 0) return false;
+
+  bool task_status_changed = false;
+  bool task_meta_changed = false;
+  if (EntryIsTaskProgress(e) && s->cb_status) {
+    int idx = (int)SendMessageW(s->cb_status, CB_GETCURSEL, 0, 0);
+    EntryStatus chosen = StatusFromComboSel(idx);
+    Task* t = FindTaskByIdIn(&tasks_copy, e.task_id);
+    if (t) {
+      e.start_time = FormatDateYYYYMMDD(t->start);
+      e.end_time = FormatDateYYYYMMDD(AddDays(t->end, 1));
+      if (t->status != chosen) {
+        t->status = chosen;
+        task_status_changed = true;
+      }
+      if (t->category != e.category) {
+        t->category = e.category;
+        task_meta_changed = true;
+      }
+      if (t->title != e.title) {
+        t->title = e.title;
+        task_meta_changed = true;
+      }
+    }
+    e.status = EntryStatus::None;
+    e.materials_dir.clear();
+  } else {
+    int idx = s->cb_status ? (int)SendMessageW(s->cb_status, CB_GETCURSEL, 0, 0) : 0;
+    e.status = StatusFromComboSel(idx);
+    e.materials_dir = s->editor_materials_dir;
+  }
+
+  bool has_any = false;
+  if (EntryIsTaskProgress(e)) {
+    has_any = !e.body_plain.empty() || !e.body_rtf_b64.empty();
+  } else {
+    has_any = !e.title.empty() || !e.body_plain.empty() || e.status != EntryStatus::None || !e.materials_dir.empty();
+  }
+
+  bool day_written = false;
+  if (has_any) {
+    if (e.source_day_ymd.empty()) e.source_day_ymd = FormatDateYYYYMMDD(s->selected);
+    e.placeholder = false;
+    std::wstring err;
+    if (!SaveEntryToBackingStore(e, s->selected, &err)) return false;
+    day_written = true;
+  }
+
+  if (task_status_changed || task_meta_changed) {
+    std::wstring terr;
+    if (!SaveTasks(tasks_copy, &terr)) {
+      if (day_written) {
+        std::wstring rollback_err;
+        (void)SaveEntryToBackingStore(original_entry, s->selected, &rollback_err);
+      }
+      return false;
+    }
+  }
+
+  s->tasks = std::move(tasks_copy);
+  if (has_any) s->day.entries[(size_t)s->editing_index] = e;
+
+  if (!CategoriesContains(s->categories, e.category)) {
+    std::vector<std::wstring> new_categories = s->categories;
+    new_categories.push_back(e.category);
+    NormalizeCategories(&new_categories);
+    std::wstring cat_err;
+    if (!SaveCategories(new_categories, &cat_err)) return false;
+    s->categories = std::move(new_categories);
+    RefreshCategoryCombo(s);
+  }
+
+  SetEditorDirty(s, false);
+  if (s->ed_title) SendMessageW(s->ed_title, EM_SETMODIFY, FALSE, 0);
+  if (s->ed_body) SendMessageW(s->ed_body, EM_SETMODIFY, FALSE, 0);
+  if (has_any) {
+    if (s->list_sort_column == 0 || s->list_sort_column == 1 || s->list_sort_column == 3) {
+      RefreshList(s);
+      if (s->editing_index >= 0 && s->editing_index < (int)s->day.entries.size()) {
+        ListView_SetItemState(s->list, s->editing_index, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_EnsureVisible(s->list, s->editing_index, FALSE);
+      }
+    } else {
+      UpdateListRowForEntry(s, s->editing_index);
+    }
+  }
   UpdateStatusBar(s);
   return true;
 }
@@ -2507,23 +3073,25 @@ static void DeleteCurrent(AppState* s) {
   std::sort(selected.begin(), selected.end());
   selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
   int next_idx = selected.front();
+  DayData original_day = s->day;
+  std::vector<Entry> entries_to_delete;
+  entries_to_delete.reserve(selected.size());
+  for (int idx : selected) {
+    if (idx >= 0 && idx < (int)s->day.entries.size()) entries_to_delete.push_back(s->day.entries[(size_t)idx]);
+  }
 
   for (auto it = selected.rbegin(); it != selected.rend(); ++it) {
     s->day.entries.erase(s->day.entries.begin() + *it);
   }
 
   std::wstring err;
-  if (!s->day.entries.empty()) {
-    if (!SaveDayFile(s->day, &err)) {
-      ShowInfoBox(s->hwnd, err.c_str(), L"删除失败");
-      return;
-    }
-  } else {
-    std::wstring path = GetDayFilePath(s->selected);
-    DeleteFileW(path.c_str());
+  if (!DeleteEntriesFromBackingStore(entries_to_delete, s->selected, &err)) {
+    s->day = std::move(original_day);
+    ShowInfoBox(s->hwnd, err.c_str(), L"删除失败");
+    return;
   }
 
-  RefreshList(s);
+  (void)LoadSelectedDay(s, s->selected);
   if (!s->day.entries.empty()) {
     if (next_idx >= (int)s->day.entries.size()) next_idx = (int)s->day.entries.size() - 1;
     s->editing_index = next_idx;
@@ -2532,7 +3100,7 @@ static void DeleteCurrent(AppState* s) {
     FillEditorFromEntry(s, s->day.entries[(size_t)next_idx], next_idx);
     SetFocus(s->ed_body ? s->ed_body : s->ed_title);
   } else {
-    ClearEditor(s);
+    ClearEditor(s, true);
     HWND h = GetComboEditHandle(s->cb_category);
     SetFocus(h ? h : s->cb_category);
   }
@@ -2546,7 +3114,7 @@ static void DiscardEditorChanges(AppState* s) {
   if (s->editing_index >= 0 && s->editing_index < (int)s->day.entries.size()) {
     FillEditorFromEntry(s, s->day.entries[(size_t)s->editing_index], s->editing_index);
   } else {
-    ClearEditor(s);
+    ClearEditor(s, true);
   }
   SetEditorDirty(s, false);
   if (s->ed_title) SendMessageW(s->ed_title, EM_SETMODIFY, FALSE, 0);
@@ -3037,19 +3605,27 @@ static bool MoveDir(const std::wstring& from, const std::wstring& to, std::wstri
   return false;
 }
 
-static void ReloadAppDataAfterFilesystemChange(AppState* s) {
-  if (!s) return;
-  {
-    std::wstring cat_err;
-    LoadCategories(&s->categories, &cat_err);
-    NormalizeCategories(&s->categories);
-    RefreshCategoryCombo(s);
+static bool ReloadAppDataAfterFilesystemChange(AppState* s) {
+  if (!s) return false;
+  std::vector<std::wstring> categories;
+  std::wstring cat_err;
+  if (!LoadCategories(&categories, &cat_err)) {
+    ShowInfoBox(s->hwnd, cat_err.c_str(), L"重新加载分类失败");
+    return false;
   }
-  {
-    std::wstring terr;
-    LoadTasks(&s->tasks, &terr);
+
+  std::vector<Task> tasks;
+  std::wstring task_err;
+  if (!LoadTasks(&tasks, &task_err)) {
+    ShowInfoBox(s->hwnd, task_err.c_str(), L"重新加载任务失败");
+    return false;
   }
-  LoadSelectedDay(s, s->selected);
+
+  NormalizeCategories(&categories);
+  s->categories = std::move(categories);
+  s->tasks = std::move(tasks);
+  RefreshCategoryCombo(s);
+  return LoadSelectedDay(s, s->selected);
 }
 
 static void ExportFullData(AppState* s) {
@@ -3119,7 +3695,10 @@ static void ImportFullData(AppState* s) {
     return;
   }
 
-  ReloadAppDataAfterFilesystemChange(s);
+  if (!ReloadAppDataAfterFilesystemChange(s)) {
+    ShowInfoBox(s->hwnd, L"数据已经导入，但界面重新加载失败。请关闭后重新打开程序。", L"导入后重载失败");
+    return;
+  }
 
   std::wstring done = L"导入完成。\n\n当前数据目录已替换。";
   if (!backup.empty()) {
@@ -3159,7 +3738,10 @@ static void ClearAllData(AppState* s) {
     return;
   }
 
-  ReloadAppDataAfterFilesystemChange(s);
+  if (!ReloadAppDataAfterFilesystemChange(s)) {
+    ShowInfoBox(s->hwnd, L"数据已经清空，但界面重新加载失败。请关闭后重新打开程序。", L"清空后重载失败");
+    return;
+  }
 
   std::wstring done =
       L"已清空数据并完成重置。\n\n"
@@ -3847,13 +4429,13 @@ static void DoExportCsv(AppState* s, bool quarter) {
   }
 
   // Open the exported file with system default app (Excel/Numbers/etc).
-  ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  (void)OpenPathInShell(s->hwnd, path, L"导出文件");
 }
 
 static void OpenDataDir(AppState* s) {
   std::wstring dir = GetDataRootDir();
   EnsureDirExists(dir);
-  ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  (void)OpenPathInShell(s ? s->hwnd : nullptr, dir, L"数据目录");
 }
 
 static void ShowHelp(AppState* s) {
@@ -4442,7 +5024,7 @@ static void TaskOpenMaterialsDir(TaskWindowState* s, bool allow_draft_dir) {
           return;
         }
         if (!DirExistsW(dir)) EnsureDirExists(dir);
-        ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        (void)OpenPathInShell(s->hwnd, dir, L"材料目录");
         return;
       }
     }
@@ -4459,7 +5041,7 @@ static void TaskOpenMaterialsDir(TaskWindowState* s, bool allow_draft_dir) {
     ShowInfoBox(s->hwnd, L"材料路径不存在或不是文件夹，请重新设置材料路径。", L"提示");
     return;
   }
-  ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  (void)OpenPathInShell(s->hwnd, dir, L"材料目录");
 }
 
 static std::wstring NewTaskId() {
@@ -4577,10 +5159,16 @@ static void SetMaterialsDirForSelected(AppState* s) {
     std::wstring picked;
     if (!PickFolderDialog(s->hwnd, L"选择长期任务材料目录(本地)", &picked)) return;
     if (!ConfirmMaterialsPathIfExternal(s->hwnd, picked)) return;
+    std::wstring old_dir = t->materials_dir;
     t->materials_dir = picked;
     if (s->editing_index == sel) s->editor_materials_dir = picked;
     std::wstring terr;
-    SaveTasks(s->tasks, &terr);
+    if (!SaveTasks(s->tasks, &terr)) {
+      t->materials_dir = old_dir;
+      if (s->editing_index == sel) s->editor_materials_dir = old_dir;
+      ShowInfoBox(s->hwnd, terr.c_str(), L"保存任务失败");
+      return;
+    }
     RefreshList(s);
     UpdateStatusBar(s);
     ShowToast(s, L"已设置该长期任务的材料路径");
@@ -4613,10 +5201,16 @@ static void ClearMaterialsDirForSelected(AppState* s) {
   if (EntryIsTaskProgress(e)) {
     Task* t = FindTaskById(s, e.task_id);
     if (!t) return;
+    std::wstring old_dir = t->materials_dir;
     t->materials_dir.clear();
     if (s->editing_index == sel) s->editor_materials_dir.clear();
     std::wstring terr;
-    SaveTasks(s->tasks, &terr);
+    if (!SaveTasks(s->tasks, &terr)) {
+      t->materials_dir = old_dir;
+      if (s->editing_index == sel) s->editor_materials_dir = old_dir;
+      ShowInfoBox(s->hwnd, terr.c_str(), L"保存任务失败");
+      return;
+    }
     RefreshList(s);
     UpdateStatusBar(s);
     ShowToast(s, L"已清除该长期任务的自定义材料路径");
@@ -4636,7 +5230,7 @@ static void OpenTaskMaterialsDir(HWND owner, const std::wstring& task_id) {
     return;
   }
   std::wstring dir = GetTaskMaterialsDirById(task_id);
-  ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  (void)OpenPathInShell(owner, dir, L"材料目录");
 }
 
 static std::wstring DateKeyYmd(const SYSTEMTIME& st) {
@@ -4667,7 +5261,7 @@ static void OpenWorkMaterialsDir(HWND owner, const SYSTEMTIME& date, const std::
     return;
   }
   std::wstring dir = GetWorkMaterialsDir(date, entry_id);
-  ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  (void)OpenPathInShell(owner, dir, L"材料目录");
 }
 
 static void OpenMaterialsDirForEntry(HWND owner, AppState* s, const Entry& e) {
@@ -4684,7 +5278,7 @@ static void OpenMaterialsDirForEntry(HWND owner, AppState* s, const Entry& e) {
         ShowInfoBox(owner, L"材料路径不存在或不是文件夹。请重新设置材料路径。", L"提示");
         return;
       }
-      ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+      (void)OpenPathInShell(owner, dir, L"材料目录");
       return;
     }
     OpenTaskMaterialsDir(owner, e.task_id);
@@ -4699,7 +5293,7 @@ static void OpenMaterialsDirForEntry(HWND owner, AppState* s, const Entry& e) {
       ShowInfoBox(owner, L"材料路径不存在或不是文件夹。请重新设置材料路径。", L"提示");
       return;
     }
-    ShellExecuteW(nullptr, L"open", e.materials_dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    (void)OpenPathInShell(owner, e.materials_dir, L"材料目录");
     return;
   }
   OpenWorkMaterialsDir(owner, s->selected, e.id);
@@ -4746,7 +5340,7 @@ static Task BuildTaskFromMeeting(const SYSTEMTIME& meeting_date, const Entry& me
 
   t.start = meeting_date;
   t.end = AddDays(meeting_date, 30);
-  t.status = EntryStatus::Todo;
+  t.status = EntryStatus::None;
   return t;
 }
 
@@ -5307,11 +5901,10 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                                      WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_TABSTOP,
                                      0, 0, 10, 10, hwnd, (HMENU)6, nullptr, nullptr);
       SendMessageW(s->cb_status, CB_ADDSTRING, 0, (LPARAM)L"无");
-      SendMessageW(s->cb_status, CB_ADDSTRING, 0, (LPARAM)L"未开始");
       SendMessageW(s->cb_status, CB_ADDSTRING, 0, (LPARAM)L"进行中");
       SendMessageW(s->cb_status, CB_ADDSTRING, 0, (LPARAM)L"阻塞");
       SendMessageW(s->cb_status, CB_ADDSTRING, 0, (LPARAM)L"已完成");
-      SendMessageW(s->cb_status, CB_SETCURSEL, 1, 0);
+      SendMessageW(s->cb_status, CB_SETCURSEL, 0, 0);
 
       s->lbl_desc = CreateWindowExW(0, L"STATIC", L"任务说明(支持富文本，可做段落/编号/缩进)",
                                     WS_CHILD | WS_VISIBLE,
@@ -5489,10 +6082,10 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             ShowInfoBox(hwnd, L"材料路径不存在或不是文件夹。请重新设置材料路径。", L"提示");
             return 0;
           }
-          ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+          (void)OpenPathInShell(hwnd, dir, L"材料目录");
         } else if (cmd == 1002) {
           std::wstring root = GetTaskMaterialsRootDir();
-          ShellExecuteW(nullptr, L"open", root.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+          (void)OpenPathInShell(hwnd, root, L"材料根目录");
         }
         return 0;
       }
@@ -5617,7 +6210,7 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
               return 0;
             }
             if (!DirExistsW(dir)) EnsureDirExists(dir);
-            ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            (void)OpenPathInShell(hwnd, dir, L"材料目录");
             return 0;
           }
           ShowInfoBox(hwnd, L"请先在左侧列表选择一个任务，或先点击“新建”。", L"提示");
@@ -5633,7 +6226,7 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
           ShowInfoBox(hwnd, L"材料路径不存在或不是文件夹。请重新设置材料路径。", L"提示");
           return 0;
         }
-        ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        (void)OpenPathInShell(hwnd, dir, L"材料目录");
         return 0;
       }
       if (id == 9) {  // delete
@@ -5751,7 +6344,7 @@ static void Layout(AppState* s) {
     for (HWND b : {s->btn_screenshot, s->btn_quick_reply, s->btn_timestamp, s->btn_focus_timer, s->btn_calc,
                    s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials, s->btn_open_materials,
                    s->btn_set_materials, s->btn_color_picker, s->btn_paste_plain, s->btn_record_system,
-                   s->btn_record_mic, s->btn_date_separator}) {
+                   s->btn_record_mic, s->btn_recordings_dir, s->btn_date_separator}) {
       set_vis(b, visible);
     }
   };
@@ -5847,10 +6440,16 @@ static void Layout(AppState* s) {
   int cols = 2;
   int bh = ScalePx(s->hwnd, 34);
   int bw = (left_w - 2 * inner - gap) / cols;
-  std::vector<HWND> btns = {s->btn_screenshot, s->btn_quick_reply, s->btn_timestamp, s->btn_focus_timer,
-                            s->btn_calc, s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials, s->btn_open_materials,
-                            s->btn_set_materials, s->btn_color_picker, s->btn_paste_plain, s->btn_record_system,
-                            s->btn_record_mic, s->btn_date_separator};
+  std::vector<HWND> btns = {
+    s->btn_screenshot, s->btn_screenshot_dir,
+    s->btn_record_system, s->btn_record_mic,
+    s->btn_recordings_dir, s->btn_color_picker,
+    s->btn_quick_reply, s->btn_timestamp,
+    s->btn_paste_plain, s->btn_date_separator,
+    s->btn_task_materials, s->btn_focus_timer,
+    s->btn_calc, s->btn_open_materials,
+    s->btn_set_materials, s->btn_data_dir
+  };
   for (size_t i = 0; i < btns.size(); i++) {
     HWND b = btns[i];
     if (!b) continue;
@@ -6061,6 +6660,8 @@ static HMENU CreateAppMenu() {
   AppendMenuW(tools, MF_STRING, IDM_IMPORT_FULL_DATA, L"导入全部数据...");
   AppendMenuW(tools, MF_STRING, IDM_CLEAR_ALL_DATA, L"清空全部数据(重置)...");
   AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(tools, MF_STRING, IDM_THEME_MUNG, L"绿豆沙主题");
+  AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(tools, MF_STRING, IDM_MANAGE_CATEGORIES, L"管理分类...\tCtrl+K");
   AppendMenuW(tools, MF_STRING, IDM_GENERATE_DEMO_DATA, L"生成示例数据(演示)...");
   AppendMenuW(menu, MF_POPUP, (UINT_PTR)tools, L"工具");
@@ -6140,7 +6741,6 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                                      WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_TABSTOP,
                                      0, 0, 10, 10, hwnd, (HMENU)IDC_CB_STATUS, nullptr, nullptr);
       SendMessageW(s->cb_status, CB_ADDSTRING, 0, (LPARAM)L"无");
-      SendMessageW(s->cb_status, CB_ADDSTRING, 0, (LPARAM)L"未开始");
       SendMessageW(s->cb_status, CB_ADDSTRING, 0, (LPARAM)L"进行中");
       SendMessageW(s->cb_status, CB_ADDSTRING, 0, (LPARAM)L"阻塞");
       SendMessageW(s->cb_status, CB_ADDSTRING, 0, (LPARAM)L"已完成");
@@ -6159,50 +6759,51 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                                     0, 0, 10, 10, hwnd, (HMENU)IDC_LBL_BODY, nullptr, nullptr);
 
       // Formatting toolbar (kept right above the body to make formatting discoverable).
+      DWORD tool_btn_style = WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP;
       s->fmt_bold = CreateWindowExW(0, L"BUTTON", L"B",
-                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                    tool_btn_style,
                                     0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_BOLD, nullptr, nullptr);
       s->fmt_italic = CreateWindowExW(0, L"BUTTON", L"I",
-                                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                      tool_btn_style,
                                       0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_ITALIC, nullptr, nullptr);
       s->fmt_underline = CreateWindowExW(0, L"BUTTON", L"U",
-                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                         tool_btn_style,
                                          0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_UNDERLINE, nullptr, nullptr);
       s->fmt_superscript = CreateWindowExW(0, L"BUTTON", L"x2",
-                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                           tool_btn_style,
                                            0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_SUPERSCRIPT, nullptr, nullptr);
       s->fmt_subscript = CreateWindowExW(0, L"BUTTON", L"x_",
-                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                         tool_btn_style,
                                          0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_SUBSCRIPT, nullptr, nullptr);
       s->fmt_numbering = CreateWindowExW(0, L"BUTTON", L"1.",
-                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                         tool_btn_style,
                                          0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_NUMBERING, nullptr, nullptr);
       s->fmt_bullet = CreateWindowExW(0, L"BUTTON", L"•",
-                                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                      tool_btn_style,
                                       0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_BULLET, nullptr, nullptr);
       s->fmt_markdown = CreateWindowExW(0, L"BUTTON", L"MD",
-                                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                        tool_btn_style,
                                         0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_MARKDOWN, nullptr, nullptr);
       s->fmt_align_left = CreateWindowExW(0, L"BUTTON", L"L",
-                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                          tool_btn_style,
                                           0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_ALIGN_LEFT, nullptr, nullptr);
       s->fmt_align_center = CreateWindowExW(0, L"BUTTON", L"C",
-                                            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                            tool_btn_style,
                                             0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_ALIGN_CENTER, nullptr, nullptr);
       s->fmt_align_right = CreateWindowExW(0, L"BUTTON", L"R",
-                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                           tool_btn_style,
                                            0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_ALIGN_RIGHT, nullptr, nullptr);
       s->fmt_indent_inc = CreateWindowExW(0, L"BUTTON", L">",
-                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                          tool_btn_style,
                                           0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_INDENT_INC, nullptr, nullptr);
       s->fmt_indent_dec = CreateWindowExW(0, L"BUTTON", L"<",
-                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                          tool_btn_style,
                                           0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_INDENT_DEC, nullptr, nullptr);
       s->fmt_clear = CreateWindowExW(0, L"BUTTON", L"清",
-                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                     tool_btn_style,
                                      0, 0, 10, 10, hwnd, (HMENU)IDC_FMT_CLEAR, nullptr, nullptr);
       s->btn_body_maximize = CreateWindowExW(0, L"BUTTON", L"最大化编辑",
-                                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                             tool_btn_style,
                                              0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_BODY_MAXIMIZE, nullptr, nullptr);
 
       s->ed_body = CreateWindowExW(WS_EX_CLIENTEDGE, L"RICHEDIT50W", L"",
@@ -6211,16 +6812,16 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                                    0, 0, 10, 10, hwnd, (HMENU)IDC_BODY, nullptr, nullptr);
 
       s->btn_new = CreateWindowExW(0, L"BUTTON", L"新增",
-                                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                   tool_btn_style,
                                    0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_NEW, nullptr, nullptr);
       s->btn_save = CreateWindowExW(0, L"BUTTON", L"保存",
-                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                    tool_btn_style,
                                     0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_SAVE, nullptr, nullptr);
       s->btn_preview = CreateWindowExW(0, L"BUTTON", L"预览",
-                                       WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                       tool_btn_style,
                                        0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_PREVIEW, nullptr, nullptr);
       s->btn_del = CreateWindowExW(0, L"BUTTON", L"删除",
-                                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                   tool_btn_style,
                                    0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_DEL, nullptr, nullptr);
 
       s->status = CreateWindowExW(0, STATUSCLASSNAMEW, nullptr,
@@ -6277,6 +6878,9 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       s->btn_record_mic = CreateWindowExW(0, L"BUTTON", L"录麦克风",
                                           office_btn_style,
                                           0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_RECORD_MIC, nullptr, nullptr);
+      s->btn_recordings_dir = CreateWindowExW(0, L"BUTTON", L"录音目录",
+                                              office_btn_style,
+                                              0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_RECORDINGS_DIR, nullptr, nullptr);
 
       // Fonts
       for (HWND h : {s->cal, s->st_day, s->list, s->lbl_category, s->lbl_start, s->lbl_end, s->lbl_title, s->lbl_body,
@@ -6289,13 +6893,14 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                      s->ed_body, s->status,
                        s->btn_new, s->btn_save, s->btn_preview, s->btn_del,
                      s->grp_office, s->btn_screenshot, s->btn_quick_reply, s->btn_timestamp, s->btn_focus_timer, s->btn_calc,
-                     s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials, s->btn_open_materials, s->btn_set_materials,
-                     s->btn_color_picker, s->btn_paste_plain, s->btn_date_separator,
-                     s->btn_record_system, s->btn_record_mic}) {
+                      s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials, s->btn_open_materials, s->btn_set_materials,
+                      s->btn_color_picker, s->btn_paste_plain, s->btn_date_separator,
+                      s->btn_record_system, s->btn_record_mic, s->btn_recordings_dir}) {
         SetControlFont(h, s->font);
       }
 
       SetMenu(hwnd, CreateAppMenu());
+      ApplyTheme(s);
 
       // Load categories
       {
@@ -6350,6 +6955,40 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       return 0;
     }
 
+    case WM_ERASEBKGND: {
+      if (s && s->brush_window) {
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        FillRect((HDC)wParam, &rc, s->brush_window);
+        return 1;
+      }
+      break;
+    }
+
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+    case WM_CTLCOLORBTN: {
+      if (!s || !s->mung_theme) break;
+      HDC dc = (HDC)wParam;
+      HWND ctl = (HWND)lParam;
+      SetTextColor(dc, ThemeTextColor(s));
+
+      if (msg == WM_CTLCOLOREDIT || msg == WM_CTLCOLORLISTBOX) {
+        SetBkColor(dc, ThemeEditColor(s));
+        return (LRESULT)s->brush_edit;
+      }
+
+      COLORREF bg = ThemeWindowColor(s);
+      HBRUSH br = s->brush_window;
+      if (msg == WM_CTLCOLORBTN || ctl == s->grp_office) {
+        bg = ThemePanelColor(s);
+        br = s->brush_panel;
+      }
+      SetBkColor(dc, bg);
+      return (LRESULT)br;
+    }
+
     case WM_TIMER: {
       if (!s) return 0;
       if (s->focus_running && wParam == s->focus_timer_id) {
@@ -6376,7 +7015,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         KillTimer(s->hwnd, s->autosave_timer_id);
         s->autosave_timer_id = 0;
         if (s->editing_index >= 0 && IsEditorTrulyDirty(s)) {
-          if (SaveCurrent(s)) ShowToast(s, L"已自动保存");
+          if (AutoSaveCurrent(s)) ShowToast(s, L"已自动保存");
         }
         return 0;
       }
@@ -6401,7 +7040,12 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       if (id == IDC_BTN_SCREENSHOT || id == IDC_BTN_QUICK_REPLY || id == IDC_BTN_TIMESTAMP || id == IDC_BTN_FOCUS_TIMER ||
           id == IDC_BTN_CALC || id == IDC_BTN_DATA_DIR || id == IDC_BTN_SCREENSHOT_DIR || id == IDC_BTN_TASK_MATERIALS_ROOT ||
           id == IDC_BTN_OPEN_MATERIALS || id == IDC_BTN_SET_MATERIALS || id == IDC_BTN_COLOR_PICKER ||
-          id == IDC_BTN_PASTE_PLAIN || id == IDC_BTN_DATE_SEPARATOR || id == IDC_BTN_RECORD_SYSTEM || id == IDC_BTN_RECORD_MIC) {
+          id == IDC_BTN_PASTE_PLAIN || id == IDC_BTN_DATE_SEPARATOR || id == IDC_BTN_RECORD_SYSTEM || id == IDC_BTN_RECORD_MIC ||
+          id == IDC_BTN_RECORDINGS_DIR || id == IDC_FMT_BOLD || id == IDC_FMT_ITALIC || id == IDC_FMT_UNDERLINE ||
+          id == IDC_FMT_SUPERSCRIPT || id == IDC_FMT_SUBSCRIPT || id == IDC_FMT_NUMBERING || id == IDC_FMT_BULLET ||
+          id == IDC_FMT_MARKDOWN || id == IDC_FMT_ALIGN_LEFT || id == IDC_FMT_ALIGN_CENTER || id == IDC_FMT_ALIGN_RIGHT ||
+          id == IDC_FMT_INDENT_INC || id == IDC_FMT_INDENT_DEC || id == IDC_FMT_CLEAR || id == IDC_BTN_BODY_MAXIMIZE ||
+          id == IDC_BTN_NEW || id == IDC_BTN_SAVE || id == IDC_BTN_PREVIEW || id == IDC_BTN_DEL) {
         DrawOfficeButton(s, reinterpret_cast<const DRAWITEMSTRUCT*>(lParam));
         return TRUE;
       }
@@ -6414,7 +7058,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
       if (id == IDC_BTN_NEW && code == BN_CLICKED) {
         if (!PromptSaveIfDirty(s)) return 0;
-        ClearEditor(s);
+        ClearEditor(s, true);
         return 0;
       }
       if (id == IDC_BTN_SAVE && code == BN_CLICKED) {
@@ -6474,6 +7118,16 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         std::wstring dir = JoinPath(GetDataRootDir(), L"screenshots");
         EnsureDirExists(dir);
         OpenPathInShell(s->hwnd, dir, L"截图目录");
+        return 0;
+      }
+      if (id == IDC_BTN_RECORDINGS_DIR && code == BN_CLICKED) {
+        std::wstring sys_dir = GetAudioRecordingsDir(AudioRecordSource::SystemLoopback);
+        std::wstring mic_dir = GetAudioRecordingsDir(AudioRecordSource::MicrophoneCapture);
+        EnsureDirExists(sys_dir);
+        EnsureDirExists(mic_dir);
+        std::wstring dir = ParentDirOf(sys_dir);
+        if (dir.empty()) dir = GetDataRootDir();
+        OpenPathInShell(s->hwnd, dir, L"录音目录");
         return 0;
       }
       if (id == IDC_BTN_TASK_MATERIALS_ROOT && code == BN_CLICKED) {
@@ -6674,6 +7328,11 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         ClearAllData(s);
         return 0;
       }
+      if (id == IDM_THEME_MUNG) {
+        s->mung_theme = !s->mung_theme;
+        ApplyTheme(s);
+        return 0;
+      }
       if (id == IDM_MANAGE_CATEGORIES) {
         if (!PromptSaveIfDirty(s)) return 0;
         ShowManageCategoriesWindow(s);
@@ -6854,17 +7513,18 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             if (idx >= 0 && idx < (int)s->day.entries.size()) {
               const auto& e = s->day.entries[(size_t)idx];
               EntryStatus st = EffectiveStatus(s, e);
-              COLORREF bk = StatusBkColor(st);
-              if (bk != CLR_NONE) {
-                cd->clrTextBk = bk;
-                cd->clrText = RGB(20, 20, 20);
-              }
+                COLORREF bk = ThemedStatusBkColor(s, st);
+                if (bk != CLR_NONE) {
+                  cd->clrTextBk = bk;
+                  cd->clrText = ThemeTextColor(s);
+                }
             }
             return CDRF_DODEFAULT;
           }
           return CDRF_DODEFAULT;
         }
         if (hdr->code == LVN_ITEMCHANGING) {
+          if (s->suppress_list_selection_sync) return FALSE;
           auto* p = reinterpret_cast<NMLISTVIEW*>(lParam);
           if ((p->uChanged & LVIF_STATE) &&
               (p->uNewState & LVIS_SELECTED) && !(p->uOldState & LVIS_SELECTED)) {
@@ -6876,6 +7536,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
           return FALSE;
         }
         if (hdr->code == LVN_ITEMCHANGED) {
+          if (s->suppress_list_selection_sync) return 0;
           auto* p = reinterpret_cast<NMLISTVIEW*>(lParam);
           if ((p->uChanged & LVIF_STATE) && (p->uNewState & LVIS_SELECTED)) {
             UpdateEditorFromListSelection(s);
@@ -6887,7 +7548,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
           if (act && act->iItem < 0) {
             // Double click on empty space: start a new entry (common expectation).
             if (!PromptSaveIfDirty(s)) return 0;
-            ClearEditor(s);
+            ClearEditor(s, true);
             HWND h = GetComboEditHandle(s->cb_category);
             SetFocus(h ? h : s->cb_category);
             return 0;
@@ -6926,6 +7587,9 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         StopAudioRecorderWithoutPrompt(s, AudioRecordSource::SystemLoopback);
         StopAudioRecorderWithoutPrompt(s, AudioRecordSource::MicrophoneCapture);
         EnsureAudioTimerState(s);
+        if (s->brush_window) DeleteObject(s->brush_window);
+        if (s->brush_panel) DeleteObject(s->brush_panel);
+        if (s->brush_edit) DeleteObject(s->brush_edit);
       }
       if (s && s->font) DeleteObject(s->font);
       PostQuitMessage(0);

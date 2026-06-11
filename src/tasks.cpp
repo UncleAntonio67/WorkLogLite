@@ -59,7 +59,7 @@ static EntryStatus StatusFromStr(const std::wstring& s) {
   if (s == L"doing") return EntryStatus::Doing;
   if (s == L"blocked") return EntryStatus::Blocked;
   if (s == L"done") return EntryStatus::Done;
-  return EntryStatus::Todo;
+  return EntryStatus::None;
 }
 
 static bool ReadFileUtf8(const std::wstring& path, std::wstring* out, std::wstring* err) {

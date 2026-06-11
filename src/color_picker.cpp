@@ -205,11 +205,15 @@ static ATOM EnsureColorPickerClass(HINSTANCE inst) {
 
 }  // namespace
 
-bool PickScreenColor(HWND owner, COLORREF* out_color) {
+bool PickScreenColor(HWND owner, COLORREF* out_color, std::wstring* err) {
   if (out_color) *out_color = RGB(0, 0, 0);
+  if (err) err->clear();
 
   HINSTANCE inst = (HINSTANCE)GetModuleHandleW(nullptr);
-  if (!EnsureColorPickerClass(inst)) return false;
+  if (!EnsureColorPickerClass(inst)) {
+    if (err) *err = L"无法注册取色器窗口类。";
+    return false;
+  }
 
   ColorPickerState state{};
   state.owner = owner;
@@ -222,7 +226,10 @@ bool PickScreenColor(HWND owner, COLORREF* out_color) {
                               WS_POPUP | WS_VISIBLE,
                               state.vx, state.vy, state.vw, state.vh,
                               owner, nullptr, inst, &state);
-  if (!hwnd) return false;
+  if (!hwnd) {
+    if (err) *err = L"无法创建取色器窗口。";
+    return false;
+  }
 
   if (owner) EnableWindow(owner, FALSE);
   while (IsWindow(hwnd)) {
@@ -231,6 +238,7 @@ bool PickScreenColor(HWND owner, COLORREF* out_color) {
       if (msg.message == WM_QUIT) {
         PostQuitMessage((int)msg.wParam);
         if (owner) EnableWindow(owner, TRUE);
+        if (err) *err = L"取色器被系统中断。";
         return false;
       }
       TranslateMessage(&msg);

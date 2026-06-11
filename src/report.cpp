@@ -46,7 +46,7 @@ static bool DateLeq(const SYSTEMTIME& a, const SYSTEMTIME& b) {
 
 static const wchar_t* StatusToCN(EntryStatus s) {
   switch (s) {
-    case EntryStatus::Todo: return L"未开始";
+    case EntryStatus::Todo: return L"";
     case EntryStatus::Doing: return L"进行中";
     case EntryStatus::Blocked: return L"阻塞";
     case EntryStatus::Done: return L"已完成";
@@ -390,7 +390,7 @@ static const Task* FindTaskById(const std::vector<Task>& tasks, const std::wstri
 
 static std::wstring StatusToCNTask(EntryStatus s) {
   switch (s) {
-    case EntryStatus::Todo: return L"未开始";
+    case EntryStatus::Todo: return L"";
     case EntryStatus::Doing: return L"进行中";
     case EntryStatus::Blocked: return L"阻塞";
     case EntryStatus::Done: return L"已完成";

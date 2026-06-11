@@ -19,6 +19,8 @@ enum class EntryStatus {
 struct Entry {
   std::wstring id;  // unique within a day file
   bool placeholder{false};  // injected UI-only entry; won't be persisted unless saved
+  // Transient: source day file date for aggregated day views. Not persisted.
+  std::wstring source_day_ymd;
 
   EntryType type{EntryType::Note};
   std::wstring task_id;  // only for TaskProgress

@@ -300,12 +300,20 @@ void TestMalformedDataTolerance() {
       "start=not-a-date\n"
       "end=2026-04-30\n"
       "status=blocked\n"
+      "END\n"
+      "TASK\n"
+      "id=task-bad-status\n"
+      "category_b64=5bel5L2c\n"
+      "title_b64=5Z2P54q25oCB\n"
+      "start=2026-04-20\n"
+      "end=2026-04-22\n"
+      "status=unexpected-status\n"
       "END\n";
   Check(WriteUtf8FileRaw(tasks_path, broken_tasks_body), L"Malformed WLT fixture written");
 
   std::vector<Task> loaded_tasks;
   Check(LoadTasks(&loaded_tasks, &err), L"LoadTasks tolerates malformed optional fields");
-  Check(loaded_tasks.size() == 1, L"Malformed WLT still yields one task");
+  Check(loaded_tasks.size() == 2, L"Malformed WLT still yields all tasks");
   Check(loaded_tasks[0].id == L"task-broken" &&
         loaded_tasks[0].status == EntryStatus::Blocked &&
         loaded_tasks[0].end.wYear == 2026 &&
@@ -317,6 +325,9 @@ void TestMalformedDataTolerance() {
         loaded_tasks[0].desc_plain.empty() &&
         loaded_tasks[0].desc_rtf_b64 == "cmF3LXRhc2stcnRm",
         L"Malformed WLT skips invalid date and bad base64 fields");
+  Check(loaded_tasks[1].id == L"task-bad-status" &&
+        loaded_tasks[1].status == EntryStatus::None,
+        L"Malformed WLT maps unknown status to none");
 }
 
 void TestTasksAndReports() {

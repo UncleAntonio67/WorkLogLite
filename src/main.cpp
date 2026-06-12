@@ -2290,14 +2290,7 @@ static void FillEditorFromEntry(AppState* s, const Entry& e, int index) {
     ApplyBodyZoom(s);
   }
 
-  // Materials dir is always editable even if task progress is read-only in other fields.
-  // For task progress, it is treated as a property of the underlying Task.
-  if (is_task && !e.task_id.empty()) {
-    Task* t = FindTaskById(s, e.task_id);
-    s->editor_materials_dir = t ? t->materials_dir : L"";
-  } else {
-    s->editor_materials_dir = e.materials_dir;
-  }
+  s->editor_materials_dir = e.materials_dir;
   if (s->ed_title) SendMessageW(s->ed_title, EM_SETMODIFY, FALSE, 0);
   if (s->ed_body) SendMessageW(s->ed_body, EM_SETMODIFY, FALSE, 0);
   s->editing_index = index;
@@ -2315,13 +2308,13 @@ static std::wstring TimeRangeText(const Entry& e) {
 }
 
 static std::wstring EntryMaterialsDirText(AppState* s, const Entry& e) {
+  if (!e.materials_dir.empty()) return e.materials_dir;
+  if (!e.id.empty()) return GetWorkMaterialsDir(s->selected, e.id);
   if (EntryIsTaskProgress(e) && !e.task_id.empty()) {
     Task* t = FindTaskById(s, e.task_id);
     if (t) return TaskMaterialsDirResolved(*t);
     return GetTaskMaterialsDirById(e.task_id);
   }
-  if (!e.materials_dir.empty()) return e.materials_dir;
-  if (!e.id.empty()) return GetWorkMaterialsDir(s->selected, e.id);
   return L"";
 }
 
@@ -2336,6 +2329,17 @@ static void UpdateListRowForEntry(AppState* s, int index) {
   ListView_SetItemText(s->list, index, 3, const_cast<wchar_t*>(StatusToCN(st)));
   std::wstring dir = EntryMaterialsDirText(s, e);
   ListView_SetItemText(s->list, index, 4, const_cast<wchar_t*>(dir.c_str()));
+}
+
+static void SelectSingleEntryInList(AppState* s, int index, bool ensure_visible = true) {
+  if (!s || !s->list) return;
+  s->suppress_list_selection_sync = true;
+  ListView_SetItemState(s->list, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+  if (index >= 0 && index < ListView_GetItemCount(s->list)) {
+    ListView_SetItemState(s->list, index, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    if (ensure_visible) ListView_EnsureVisible(s->list, index, FALSE);
+  }
+  s->suppress_list_selection_sync = false;
 }
 
 static int CompareTextNoCase(const std::wstring& a, const std::wstring& b) {
@@ -2455,10 +2459,9 @@ static void RefreshList(AppState* s) {
     restore_index = prev_sel;
   }
   if (restore_index >= 0) {
-    ListView_SetItemState(s->list, restore_index, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
-    ListView_EnsureVisible(s->list, restore_index, FALSE);
+    SelectSingleEntryInList(s, restore_index);
   }
-  s->suppress_list_selection_sync = false;
+  else s->suppress_list_selection_sync = false;
 
   UpdateDayHeader(s);
 }
@@ -2522,8 +2525,7 @@ static bool LoadSelectedDay(AppState* s, const SYSTEMTIME& date) {
     for (int i = 0; i < (int)s->day.entries.size(); ++i) {
       if (s->day.entries[(size_t)i].id == restore_entry_id) {
         s->editing_index = i;
-        ListView_SetItemState(s->list, i, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
-        ListView_EnsureVisible(s->list, i, FALSE);
+        SelectSingleEntryInList(s, i);
         FillEditorFromEntry(s, s->day.entries[(size_t)i], i);
         UpdateDayHeader(s);
         UpdateStatusBar(s);
@@ -2801,12 +2803,7 @@ static bool SaveEditorToModel(AppState* s, bool* out_changed) {
     e.status = StatusFromComboSel(idx);
   }
 
-  // Materials dir: for task progress it is treated as a property of the Task, not the per-day entry.
-  if (EntryIsTaskProgress(e)) {
-    e.materials_dir.clear();
-  } else {
-    e.materials_dir = s->editor_materials_dir;
-  }
+  e.materials_dir = s->editor_materials_dir;
 
   // Trim category
   while (!e.category.empty() && iswspace(e.category.front())) e.category.erase(e.category.begin());
@@ -2836,10 +2833,9 @@ static bool SaveEditorToModel(AppState* s, bool* out_changed) {
 
   bool has_any = false;
   if (EntryIsTaskProgress(e)) {
-    // Task progress placeholders are injected into the day view. Autosave should not
-    // materialize them as persisted daily records unless the user actually wrote progress.
-    // Task title/category/status are task-level data and are saved separately to tasks.wlt.
-    has_any = !e.body_plain.empty() || !e.body_rtf_b64.empty();
+    // Task progress placeholders are injected into the day view. Persist them once the user
+    // adds actual per-day content such as notes or a materials path.
+    has_any = !e.body_plain.empty() || !e.body_rtf_b64.empty() || !e.materials_dir.empty();
   } else {
     has_any = !e.title.empty() || !e.body_plain.empty() || e.status != EntryStatus::None || !e.materials_dir.empty();
   }
@@ -2997,16 +2993,15 @@ static bool AutoSaveCurrent(AppState* s) {
       }
     }
     e.status = EntryStatus::None;
-    e.materials_dir.clear();
   } else {
     int idx = s->cb_status ? (int)SendMessageW(s->cb_status, CB_GETCURSEL, 0, 0) : 0;
     e.status = StatusFromComboSel(idx);
-    e.materials_dir = s->editor_materials_dir;
   }
+  e.materials_dir = s->editor_materials_dir;
 
   bool has_any = false;
   if (EntryIsTaskProgress(e)) {
-    has_any = !e.body_plain.empty() || !e.body_rtf_b64.empty();
+    has_any = !e.body_plain.empty() || !e.body_rtf_b64.empty() || !e.materials_dir.empty();
   } else {
     has_any = !e.title.empty() || !e.body_plain.empty() || e.status != EntryStatus::None || !e.materials_dir.empty();
   }
@@ -3051,8 +3046,7 @@ static bool AutoSaveCurrent(AppState* s) {
     if (s->list_sort_column == 0 || s->list_sort_column == 1 || s->list_sort_column == 3) {
       RefreshList(s);
       if (s->editing_index >= 0 && s->editing_index < (int)s->day.entries.size()) {
-        ListView_SetItemState(s->list, s->editing_index, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
-        ListView_EnsureVisible(s->list, s->editing_index, FALSE);
+        SelectSingleEntryInList(s, s->editing_index);
       }
     } else {
       UpdateListRowForEntry(s, s->editing_index);
@@ -3095,8 +3089,7 @@ static void DeleteCurrent(AppState* s) {
   if (!s->day.entries.empty()) {
     if (next_idx >= (int)s->day.entries.size()) next_idx = (int)s->day.entries.size() - 1;
     s->editing_index = next_idx;
-    ListView_SetItemState(s->list, next_idx, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
-    ListView_EnsureVisible(s->list, next_idx, FALSE);
+    SelectSingleEntryInList(s, next_idx);
     FillEditorFromEntry(s, s->day.entries[(size_t)next_idx], next_idx);
     SetFocus(s->ed_body ? s->ed_body : s->ed_title);
   } else {
@@ -5138,90 +5131,76 @@ static void SetMaterialsDirForSelected(AppState* s) {
 
   int sel = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
   if (sel < 0 || sel >= (int)s->day.entries.size()) {
-    // No selection: apply to current editor (useful for new entries before saving).
     std::wstring picked;
     if (!PickFolderDialog(s->hwnd, L"选择材料目录(本地)", &picked)) return;
     if (!ConfirmMaterialsPathIfExternal(s->hwnd, picked)) return;
+    std::wstring old_dir = s->editor_materials_dir;
     s->editor_materials_dir = picked;
     SetEditorDirty(s, true);
-    UpdateStatusBar(s);
-    ShowToast(s, L"已设置当前编辑内容的材料路径(保存后生效)");
+    if (!SaveCurrent(s)) {
+      s->editor_materials_dir = old_dir;
+      UpdateStatusBar(s);
+      return;
+    }
+    ShowToast(s, L"已设置当前编辑内容的材料路径");
     return;
   }
 
   Entry& e = s->day.entries[(size_t)sel];
-  if (EntryIsTaskProgress(e)) {
-    Task* t = FindTaskById(s, e.task_id);
-    if (!t) {
-      ShowInfoBox(s->hwnd, L"未找到对应的长期任务，无法设置材料路径。", L"提示");
-      return;
-    }
-    std::wstring picked;
-    if (!PickFolderDialog(s->hwnd, L"选择长期任务材料目录(本地)", &picked)) return;
-    if (!ConfirmMaterialsPathIfExternal(s->hwnd, picked)) return;
-    std::wstring old_dir = t->materials_dir;
-    t->materials_dir = picked;
-    if (s->editing_index == sel) s->editor_materials_dir = picked;
-    std::wstring terr;
-    if (!SaveTasks(s->tasks, &terr)) {
-      t->materials_dir = old_dir;
-      if (s->editing_index == sel) s->editor_materials_dir = old_dir;
-      ShowInfoBox(s->hwnd, terr.c_str(), L"保存任务失败");
-      return;
-    }
-    RefreshList(s);
-    UpdateStatusBar(s);
-    ShowToast(s, L"已设置该长期任务的材料路径");
-    return;
-  }
-
   std::wstring picked;
   if (!PickFolderDialog(s->hwnd, L"选择材料目录(本地)", &picked)) return;
   if (!ConfirmMaterialsPathIfExternal(s->hwnd, picked)) return;
 
+  std::wstring old_dir = e.materials_dir;
   e.materials_dir = picked;
   if (s->editing_index == sel) s->editor_materials_dir = picked;
-  SetEditorDirty(s, true);
+  std::wstring err;
+  if (!SaveEntryToBackingStore(e, s->selected, &err)) {
+    e.materials_dir = old_dir;
+    if (s->editing_index == sel) s->editor_materials_dir = old_dir;
+    ShowInfoBox(s->hwnd, err.c_str(), L"保存失败");
+    return;
+  }
+  SetEditorDirty(s, false);
+  if (s->ed_title) SendMessageW(s->ed_title, EM_SETMODIFY, FALSE, 0);
+  if (s->ed_body) SendMessageW(s->ed_body, EM_SETMODIFY, FALSE, 0);
   RefreshList(s);
   UpdateStatusBar(s);
-  ShowToast(s, L"已设置该条目的材料路径(保存后写入数据)");
+  ShowToast(s, L"已设置该条目的材料路径");
 }
 
 static void ClearMaterialsDirForSelected(AppState* s) {
   if (!s) return;
   int sel = ListView_GetNextItem(s->list, -1, LVNI_SELECTED);
   if (sel < 0 || sel >= (int)s->day.entries.size()) {
+    std::wstring old_dir = s->editor_materials_dir;
     s->editor_materials_dir.clear();
     SetEditorDirty(s, true);
-    UpdateStatusBar(s);
+    if (!SaveCurrent(s)) {
+      s->editor_materials_dir = old_dir;
+      UpdateStatusBar(s);
+      return;
+    }
     ShowToast(s, L"已清除当前编辑内容的材料路径");
     return;
   }
   Entry& e = s->day.entries[(size_t)sel];
-  if (EntryIsTaskProgress(e)) {
-    Task* t = FindTaskById(s, e.task_id);
-    if (!t) return;
-    std::wstring old_dir = t->materials_dir;
-    t->materials_dir.clear();
-    if (s->editing_index == sel) s->editor_materials_dir.clear();
-    std::wstring terr;
-    if (!SaveTasks(s->tasks, &terr)) {
-      t->materials_dir = old_dir;
-      if (s->editing_index == sel) s->editor_materials_dir = old_dir;
-      ShowInfoBox(s->hwnd, terr.c_str(), L"保存任务失败");
-      return;
-    }
-    RefreshList(s);
-    UpdateStatusBar(s);
-    ShowToast(s, L"已清除该长期任务的自定义材料路径");
-    return;
-  }
+  std::wstring old_dir = e.materials_dir;
   e.materials_dir.clear();
   if (s->editing_index == sel) s->editor_materials_dir.clear();
-  SetEditorDirty(s, true);
+  std::wstring err;
+  if (!SaveEntryToBackingStore(e, s->selected, &err)) {
+    e.materials_dir = old_dir;
+    if (s->editing_index == sel) s->editor_materials_dir = old_dir;
+    ShowInfoBox(s->hwnd, err.c_str(), L"保存失败");
+    return;
+  }
+  SetEditorDirty(s, false);
+  if (s->ed_title) SendMessageW(s->ed_title, EM_SETMODIFY, FALSE, 0);
+  if (s->ed_body) SendMessageW(s->ed_body, EM_SETMODIFY, FALSE, 0);
   RefreshList(s);
   UpdateStatusBar(s);
-  ShowToast(s, L"已清除该条目的自定义材料路径(保存后写入数据)");
+  ShowToast(s, L"已清除该条目的自定义材料路径");
 }
 
 static void OpenTaskMaterialsDir(HWND owner, const std::wstring& task_id) {
@@ -5266,6 +5245,18 @@ static void OpenWorkMaterialsDir(HWND owner, const SYSTEMTIME& date, const std::
 
 static void OpenMaterialsDirForEntry(HWND owner, AppState* s, const Entry& e) {
   if (!s) return;
+  if (!e.materials_dir.empty()) {
+    if (IsNetworkPathForbidden(e.materials_dir)) {
+      ShowInfoBox(owner, L"材料路径为网络共享(UNC)，出于安全考虑已禁止打开。请改为本地目录。", L"提示");
+      return;
+    }
+    if (!DirExistsW(e.materials_dir)) {
+      ShowInfoBox(owner, L"材料路径不存在或不是文件夹。请重新设置材料路径。", L"提示");
+      return;
+    }
+    (void)OpenPathInShell(owner, e.materials_dir, L"材料目录");
+    return;
+  }
   if (EntryIsTaskProgress(e) && !e.task_id.empty()) {
     Task* t = FindTaskById(s, e.task_id);
     if (t) {
@@ -5284,30 +5275,18 @@ static void OpenMaterialsDirForEntry(HWND owner, AppState* s, const Entry& e) {
     OpenTaskMaterialsDir(owner, e.task_id);
     return;
   }
-  if (!e.materials_dir.empty()) {
-    if (IsNetworkPathForbidden(e.materials_dir)) {
-      ShowInfoBox(owner, L"材料路径为网络共享(UNC)，出于安全考虑已禁止打开。请改为本地目录。", L"提示");
-      return;
-    }
-    if (!DirExistsW(e.materials_dir)) {
-      ShowInfoBox(owner, L"材料路径不存在或不是文件夹。请重新设置材料路径。", L"提示");
-      return;
-    }
-    (void)OpenPathInShell(owner, e.materials_dir, L"材料目录");
-    return;
-  }
   OpenWorkMaterialsDir(owner, s->selected, e.id);
 }
 
 static void EnsureMaterialsDirForEntry(AppState* s, const Entry& e) {
   if (!s) return;
-  if (EntryIsTaskProgress(e) && !e.task_id.empty()) {
-    (void)GetTaskMaterialsDirById(e.task_id);
-    return;
-  }
   if (!e.materials_dir.empty()) return;
   if (!e.id.empty()) {
     (void)GetWorkMaterialsDir(s->selected, e.id);
+    return;
+  }
+  if (EntryIsTaskProgress(e) && !e.task_id.empty()) {
+    (void)GetTaskMaterialsDirById(e.task_id);
   }
 }
 

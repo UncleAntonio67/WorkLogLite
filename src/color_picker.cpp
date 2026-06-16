@@ -129,7 +129,7 @@ static void DrawOverlay(ColorPickerState* s, HDC dc) {
   RECT tr{panel.left + 64, panel.top + 12, panel.right - 10, panel.bottom - 10};
   DrawTextW(dc, hex.c_str(), -1, &tr, DT_LEFT | DT_TOP | DT_SINGLELINE);
   tr.top += 22;
-  DrawTextW(dc, L"�������  Escȡ��", -1, &tr, DT_LEFT | DT_TOP | DT_SINGLELINE);
+  DrawTextW(dc, L"单击取色，右键或 Esc 取消", -1, &tr, DT_LEFT | DT_TOP | DT_SINGLELINE);
 }
 
 static LRESULT CALLBACK ColorPickerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -231,13 +231,11 @@ bool PickScreenColor(HWND owner, COLORREF* out_color, std::wstring* err) {
     return false;
   }
 
-  if (owner) EnableWindow(owner, FALSE);
   while (IsWindow(hwnd)) {
     MSG msg{};
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
       if (msg.message == WM_QUIT) {
         PostQuitMessage((int)msg.wParam);
-        if (owner) EnableWindow(owner, TRUE);
         if (err) *err = L"取色器被系统中断。";
         return false;
       }
@@ -246,11 +244,6 @@ bool PickScreenColor(HWND owner, COLORREF* out_color, std::wstring* err) {
     }
     WaitMessage();
   }
-  if (owner) {
-    EnableWindow(owner, TRUE);
-    SetForegroundWindow(owner);
-  }
-
   if (state.accepted) {
     if (out_color) *out_color = state.color;
     return true;

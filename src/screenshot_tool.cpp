@@ -814,14 +814,12 @@ void StartScreenshotTool(HWND owner) {
   SetForegroundWindow(hwnd);
   SetFocus(hwnd);
 
-  // Modal loop so this tool is self-contained and doesn't interfere with the main app state.
-  EnableWindow(owner, FALSE);
+  // Local loop so the tool remains self-contained without toggling the owner window state.
   while (IsWindow(hwnd)) {
     MSG msg{};
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
       if (msg.message == WM_QUIT) {
         PostQuitMessage((int)msg.wParam);
-        EnableWindow(owner, TRUE);
         return;
       }
       TranslateMessage(&msg);
@@ -829,6 +827,4 @@ void StartScreenshotTool(HWND owner) {
     }
     WaitMessage();
   }
-  EnableWindow(owner, TRUE);
-  SetForegroundWindow(owner);
 }

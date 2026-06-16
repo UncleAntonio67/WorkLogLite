@@ -110,6 +110,7 @@ enum : int {
   IDC_BTN_PASTE_PLAIN = 2074,
   IDC_BTN_DATE_SEPARATOR = 2075,
   IDC_BTN_RECORDINGS_DIR = 2076,
+  IDC_BTN_TEMPLATES = 2077,
   IDC_STATUS = 2020,
   IDC_CB_STATUS = 2021,
   IDC_LBL_CATEGORY = 2030,
@@ -156,6 +157,7 @@ struct AppState {
   HWND btn_record_system{};
   HWND btn_record_mic{};
   HWND btn_recordings_dir{};
+  HWND btn_templates{};
   HWND btn_color_picker{};
   HWND btn_paste_plain{};
   HWND btn_date_separator{};
@@ -245,6 +247,14 @@ struct EditorSnapshot {
   std::wstring materials_dir;
 };
 
+struct EditorCaretSnapshot {
+  bool focus_body{false};
+  bool focus_title{false};
+  DWORD title_sel_start{0};
+  DWORD title_sel_end{0};
+  CHARRANGE body_sel{0, 0};
+};
+
 // Forward declarations used by small UI helpers defined early in this file.
 static std::wstring NormalizeNewlinesToCrlf(const std::wstring& s);
 static bool CopyToClipboard(HWND hwnd, const std::wstring& text);
@@ -262,17 +272,20 @@ static void OpenDataDir(AppState* s);
 static std::wstring ParentDirOf(const std::wstring& path);
 static std::wstring JoinPathLoose(const std::wstring& a, const std::wstring& b);
 static std::wstring NormalizeDirForCompare(const std::wstring& path);
+static std::wstring SanitizeFileName(const std::wstring& s);
 static void ApplyTheme(AppState* s);
 static COLORREF StatusBkColor(EntryStatus st);
 static std::wstring FormatWin32ErrorMessage(DWORD err);
 static bool ReadClipboardText(HWND hwnd, std::wstring* out);
 static std::string RichEditGetRtfBytes(HWND rich);
 static void RichEditSetRtfBytes(HWND rich, const std::string& bytes);
+static bool DeleteFileBestEffort(const std::wstring& path, std::wstring* err);
 static std::wstring GetTaskMaterialsDirById(const std::wstring& task_id);
 static std::wstring TaskMaterialsDirResolved(const Task& t);
 static std::wstring GetWorkMaterialsDir(const SYSTEMTIME& date, const std::wstring& entry_id);
 static bool IsNetworkPathForbidden(const std::wstring& path);
 static bool OpenPathInShell(HWND owner, const std::wstring& path, const wchar_t* what);
+static void ShowTemplateMenu(AppState* s);
 static int CompareSystemTimeDateOnly(const SYSTEMTIME& a, const SYSTEMTIME& b);
 static void TaskInitListColumns(HWND list);
 static void ShowUnitCalcWindow(HWND owner);
@@ -293,8 +306,11 @@ static void OpenMaterialsDirForEntry(HWND owner, AppState* s, const Entry& e);
 static void EnsureMaterialsDirForEntry(AppState* s, const Entry& e);
 static EditorSnapshot CaptureEditorSnapshot(AppState* s);
 static void RestoreEditorSnapshot(AppState* s, const EditorSnapshot& snap, bool mark_clean);
+static EditorCaretSnapshot CaptureEditorCaretSnapshot(AppState* s);
+static void RestoreEditorCaretSnapshot(AppState* s, const EditorCaretSnapshot& snap);
 static void UpdateStatusBar(AppState* s);
 static bool AutoSaveCurrent(AppState* s);
+static bool PromptSaveIfDirty(AppState* s);
 
 static UINT QueryDpiForWindowCompat(HWND hwnd) {
   HMODULE user32 = GetModuleHandleW(L"user32.dll");
@@ -509,6 +525,40 @@ static void RestoreEditorSnapshot(AppState* s, const EditorSnapshot& snap, bool 
   }
   s->suppress_editor_change_tracking = false;
   UpdateStatusBar(s);
+}
+
+static EditorCaretSnapshot CaptureEditorCaretSnapshot(AppState* s) {
+  EditorCaretSnapshot snap{};
+  if (!s) return snap;
+  HWND focus = GetFocus();
+  snap.focus_body = (focus == s->ed_body);
+  snap.focus_title = (focus == s->ed_title);
+  if (s->ed_title) {
+    DWORD start = 0;
+    DWORD end = 0;
+    SendMessageW(s->ed_title, EM_GETSEL, (WPARAM)&start, (LPARAM)&end);
+    snap.title_sel_start = start;
+    snap.title_sel_end = end;
+  }
+  if (s->ed_body) {
+    SendMessageW(s->ed_body, EM_EXGETSEL, 0, (LPARAM)&snap.body_sel);
+  }
+  return snap;
+}
+
+static void RestoreEditorCaretSnapshot(AppState* s, const EditorCaretSnapshot& snap) {
+  if (!s) return;
+  if (s->ed_title) {
+    SendMessageW(s->ed_title, EM_SETSEL, snap.title_sel_start, snap.title_sel_end);
+  }
+  if (s->ed_body) {
+    SendMessageW(s->ed_body, EM_EXSETSEL, 0, (LPARAM)&snap.body_sel);
+  }
+  if (snap.focus_body && s->ed_body) {
+    SetFocus(s->ed_body);
+  } else if (snap.focus_title && s->ed_title) {
+    SetFocus(s->ed_title);
+  }
 }
 
 static void RefreshCategoryCombo(AppState* s) {
@@ -1083,9 +1133,12 @@ static void FinishAudioRecording(AppState* s, AudioRecordSource source) {
   std::wstring save_err;
   if (!PromptSaveRecordedAudio(s->hwnd, source, temp_path, &save_path, &cancelled, &save_err)) {
     if (cancelled) {
-      std::wstring folder = ParentDirOf(temp_path);
-      if (!folder.empty()) OpenPathInShell(s->hwnd, folder, L"录音目录");
-      ShowToast(s, std::wstring(AudioSourceCn(source)) + L"录音已保留到默认目录");
+      std::wstring del_err;
+      if (!DeleteFileBestEffort(temp_path, &del_err)) {
+        ShowInfoBox(s->hwnd, del_err.c_str(), L"取消录音保存");
+        return;
+      }
+      ShowToast(s, std::wstring(AudioSourceCn(source)) + L"录音已取消");
       return;
     }
     std::wstring msg = save_err.empty() ? L"打开保存窗口失败。录音已保留在默认目录。" : save_err + L"\n\n录音已保留在默认目录。";
@@ -1346,6 +1399,201 @@ static void OpenScratchpadFile(HWND owner) {
   if ((INT_PTR)r <= 32) ShowInfoBox(owner, L"无法打开便签文件。", L"便签");
 }
 
+struct WorkTemplateDef {
+  std::wstring name;
+  std::wstring category;
+  std::wstring title;
+  std::wstring body;
+};
+
+static std::wstring GetTemplatesFilePath() {
+  return JoinPath(GetDataRootDir(), L"templates.txt");
+}
+
+static std::wstring GetTemplateDraftsDir() {
+  return JoinPath(GetDataRootDir(), L"template_drafts");
+}
+
+static std::wstring ExpandTemplateVars(const std::wstring& text, const SYSTEMTIME& selected) {
+  std::wstring out = text;
+  auto replace_all = [&](const wchar_t* from, const std::wstring& to) {
+    size_t pos = 0;
+    std::wstring needle = from;
+    while ((pos = out.find(needle, pos)) != std::wstring::npos) {
+      out.replace(pos, needle.size(), to);
+      pos += to.size();
+    }
+  };
+
+  wchar_t yyyy[8]{}, mm[4]{}, dd[4]{}, ymd[16]{}, ym[16]{};
+  wsprintfW(yyyy, L"%04d", (int)selected.wYear);
+  wsprintfW(mm, L"%02d", (int)selected.wMonth);
+  wsprintfW(dd, L"%02d", (int)selected.wDay);
+  wsprintfW(ymd, L"%04d-%02d-%02d", (int)selected.wYear, (int)selected.wMonth, (int)selected.wDay);
+  wsprintfW(ym, L"%04d-%02d", (int)selected.wYear, (int)selected.wMonth);
+  replace_all(L"${date}", ymd);
+  replace_all(L"${year}", yyyy);
+  replace_all(L"${month}", mm);
+  replace_all(L"${day}", dd);
+  replace_all(L"${year_month}", ym);
+  return out;
+}
+
+static std::wstring DefaultTemplatesText() {
+  return
+      L"[TEMPLATE 周报]\n"
+      L"category=周报\n"
+      L"title=周报 - ${date}\n"
+      L"body=\n"
+      L"本周完成：\n"
+      L"1. \n"
+      L"\n"
+      L"下周计划：\n"
+      L"1. \n"
+      L"\n"
+      L"风险与协同：\n"
+      L"1. \n"
+      L"[[END]]\n"
+      L"\n"
+      L"[TEMPLATE 年报]\n"
+      L"category=年报\n"
+      L"title=年报 - ${year}\n"
+      L"body=\n"
+      L"年度重点工作：\n"
+      L"1. \n"
+      L"\n"
+      L"关键成果：\n"
+      L"1. \n"
+      L"\n"
+      L"问题与改进：\n"
+      L"1. \n"
+      L"[[END]]\n"
+      L"\n"
+      L"[TEMPLATE 会议纪要]\n"
+      L"category=会议\n"
+      L"title=会议纪要 - ${date}\n"
+      L"body=\n"
+      L"会议主题：\n"
+      L"\n"
+      L"参会人员：\n"
+      L"\n"
+      L"核心结论：\n"
+      L"1. \n"
+      L"\n"
+      L"待办事项：\n"
+      L"1. \n"
+      L"[[END]]\n";
+}
+
+static bool LoadWorkTemplates(std::vector<WorkTemplateDef>* out, std::wstring* err) {
+  if (!out) return false;
+  out->clear();
+  EnsureDirExists(GetDataRootDir());
+  std::wstring path = GetTemplatesFilePath();
+  if (!FileExists(path)) {
+    std::wstring write_err;
+    if (!WriteUtf8File(path, DefaultTemplatesText(), &write_err)) {
+      if (err) *err = write_err;
+      return false;
+    }
+  }
+
+  std::wstring content;
+  if (!ReadFileUtf8Simple(path, &content, err)) return false;
+
+  std::wstringstream ss(content);
+  std::wstring line;
+  WorkTemplateDef cur{};
+  bool in_template = false;
+  bool in_body = false;
+
+  auto flush = [&]() {
+    if (!in_template || cur.name.empty()) return;
+    while (!cur.body.empty() && (cur.body.back() == L'\n' || cur.body.back() == L'\r')) cur.body.pop_back();
+    out->push_back(cur);
+    cur = WorkTemplateDef{};
+    in_template = false;
+    in_body = false;
+  };
+
+  while (std::getline(ss, line)) {
+    if (!line.empty() && line.back() == L'\r') line.pop_back();
+    if (!in_body && line.rfind(L"[TEMPLATE ", 0) == 0 && !line.empty() && line.back() == L']') {
+      flush();
+      in_template = true;
+      cur.name = line.substr(10, line.size() - 11);
+      continue;
+    }
+    if (!in_template) continue;
+    if (line == L"[[END]]") {
+      flush();
+      continue;
+    }
+    if (in_body) {
+      cur.body += line;
+      cur.body += L"\n";
+      continue;
+    }
+    if (line.rfind(L"category=", 0) == 0) {
+      cur.category = line.substr(9);
+      continue;
+    }
+    if (line.rfind(L"title=", 0) == 0) {
+      cur.title = line.substr(6);
+      continue;
+    }
+    if (line == L"body=") {
+      in_body = true;
+      continue;
+    }
+  }
+  flush();
+  return true;
+}
+
+static bool OpenTemplateDraftFromTemplate(HWND owner, const WorkTemplateDef& t, const SYSTEMTIME& selected) {
+  EnsureDirExists(GetDataRootDir());
+  std::wstring drafts_dir = GetTemplateDraftsDir();
+  if (!EnsureDirExists(drafts_dir)) {
+    ShowInfoBox(owner, L"无法创建模板草稿目录。", L"模板");
+    return false;
+  }
+
+  std::wstring category = ExpandTemplateVars(t.category, selected);
+  std::wstring title = ExpandTemplateVars(t.title, selected);
+  std::wstring body = ExpandTemplateVars(t.body, selected);
+
+  SYSTEMTIME now{};
+  GetLocalTime(&now);
+  wchar_t stamp[32]{};
+  wsprintfW(stamp, L"%04d%02d%02d-%02d%02d%02d",
+            (int)now.wYear, (int)now.wMonth, (int)now.wDay,
+            (int)now.wHour, (int)now.wMinute, (int)now.wSecond);
+
+  std::wstring base_name = SanitizeFileName(t.name.empty() ? L"模板草稿" : t.name);
+  if (base_name.empty()) base_name = L"模板草稿";
+  std::wstring path = JoinPath(drafts_dir, base_name + L"-" + stamp + L".md");
+
+  std::wstring content;
+  if (!title.empty()) content += L"# " + title + L"\n\n";
+  if (!category.empty()) content += L"分类：" + category + L"\n\n";
+  content += body;
+  if (!content.empty() && content.back() != L'\n') content += L"\n";
+
+  std::wstring err;
+  if (!WriteUtf8File(path, content, &err)) {
+    ShowInfoBox(owner, err.c_str(), L"模板");
+    return false;
+  }
+
+  HINSTANCE r = ShellExecuteW(nullptr, L"open", L"notepad.exe", path.c_str(), nullptr, SW_SHOWNORMAL);
+  if ((INT_PTR)r <= 32) {
+    ShowInfoBox(owner, L"无法打开模板草稿文件。", L"模板");
+    return false;
+  }
+  return true;
+}
+
 static bool OpenPathInShell(HWND owner, const std::wstring& path, const wchar_t* what) {
   if (path.empty()) {
     ShowInfoBox(owner, L"路径为空，无法打开。", what ? what : L"提示");
@@ -1366,7 +1614,7 @@ static void OpenSelectedDayFolder(AppState* s) {
   std::wstring dir = ParentDirOf(path);
   if (dir.empty()) return;
   EnsureDirExists(dir);
-  ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  (void)OpenPathInShell(s->hwnd, dir, L"日志目录");
 }
 
 static std::vector<std::wstring> ParseQuickRepliesContent(const std::wstring& content) {
@@ -1606,6 +1854,65 @@ static void ShowQuickReplyMenu(AppState* s) {
   ShowToast(s, L"常用回复已复制到剪贴板");
 }
 
+static void ApplyWorkTemplate(AppState* s, const WorkTemplateDef& t) {
+  if (!s) return;
+  if (OpenTemplateDraftFromTemplate(s->hwnd, t, s->selected)) {
+    ShowToast(s, L"已创建模板草稿");
+  }
+}
+
+static void ShowTemplateMenu(AppState* s) {
+  if (!s) return;
+
+  std::vector<WorkTemplateDef> templates;
+  std::wstring err;
+  if (!LoadWorkTemplates(&templates, &err)) {
+    ShowInfoBox(s->hwnd, err.c_str(), L"读取模板失败");
+    return;
+  }
+  if (templates.empty()) {
+    ShowInfoBox(s->hwnd, L"未找到可用模板。请先编辑 templates.txt。", L"模板");
+    return;
+  }
+
+  enum : UINT { IDM_TPL_BASE = 14100 };
+  HMENU menu = CreatePopupMenu();
+  if (!menu) return;
+  UINT id = IDM_TPL_BASE;
+  for (const auto& item : templates) {
+    if (id >= IDM_TPL_BASE + 200) break;
+    std::wstring label = item.name;
+    if (!item.category.empty()) label += L" [" + item.category + L"]";
+    AppendMenuW(menu, MF_STRING, id++, label.c_str());
+  }
+  AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(menu, MF_STRING, IDM_TPL_BASE + 999, L"编辑 templates.txt");
+  AppendMenuW(menu, MF_STRING, IDM_TPL_BASE + 1000, L"打开模板目录");
+
+  POINT pt{};
+  GetCursorPos(&pt);
+  UINT cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, s->hwnd, nullptr);
+  DestroyMenu(menu);
+  if (!cmd) return;
+
+  if (cmd == IDM_TPL_BASE + 999) {
+    std::wstring path = GetTemplatesFilePath();
+    HINSTANCE r = ShellExecuteW(nullptr, L"open", L"notepad.exe", path.c_str(), nullptr, SW_SHOWNORMAL);
+    if ((INT_PTR)r <= 32) ShowInfoBox(s->hwnd, L"无法打开模板文件。", L"模板");
+    return;
+  }
+  if (cmd == IDM_TPL_BASE + 1000) {
+    std::wstring dir = GetTemplateDraftsDir();
+    EnsureDirExists(dir);
+    OpenPathInShell(s->hwnd, dir, L"模板目录");
+    return;
+  }
+
+  size_t idx = (size_t)(cmd - IDM_TPL_BASE);
+  if (idx >= templates.size()) return;
+  ApplyWorkTemplate(s, templates[idx]);
+}
+
 enum : int {
   IDC_UCALC_VALUE = 17001,
   IDC_UCALC_FROM = 17002,
@@ -1634,37 +1941,33 @@ struct UnitCalcTimeUnit {
 
 static const UnitCalcUnit kUnitCalcUnits[] = {
     {L"B", 1.0, false},
-    {L"KB", 1000.0, false},
-    {L"MB", 1000.0 * 1000.0, false},
-    {L"GB", 1000.0 * 1000.0 * 1000.0, false},
-    {L"TB", 1000.0 * 1000.0 * 1000.0 * 1000.0, false},
+    {L"KB", 1024.0, false},
+    {L"MB", 1024.0 * 1024.0, false},
+    {L"GB", 1024.0 * 1024.0 * 1024.0, false},
+    {L"TB", 1024.0 * 1024.0 * 1024.0 * 1024.0, false},
     {L"KiB", 1024.0, false},
     {L"MiB", 1024.0 * 1024.0, false},
     {L"GiB", 1024.0 * 1024.0 * 1024.0, false},
     {L"TiB", 1024.0 * 1024.0 * 1024.0 * 1024.0, false},
     {L"bps", 1.0 / 8.0, true},
-    {L"Kbps", 1000.0 / 8.0, true},
-    {L"Mbps", 1000.0 * 1000.0 / 8.0, true},
-    {L"Gbps", 1000.0 * 1000.0 * 1000.0 / 8.0, true},
+    {L"Kbps", 1024.0 / 8.0, true},
+    {L"Mbps", 1024.0 * 1024.0 / 8.0, true},
+    {L"Gbps", 1024.0 * 1024.0 * 1024.0 / 8.0, true},
     {L"B/s", 1.0, true},
-    {L"KB/s", 1000.0, true},
-    {L"MB/s", 1000.0 * 1000.0, true},
-    {L"GB/s", 1000.0 * 1000.0 * 1000.0, true},
+    {L"KB/s", 1024.0, true},
+    {L"MB/s", 1024.0 * 1024.0, true},
+    {L"GB/s", 1024.0 * 1024.0 * 1024.0, true},
 };
 
 static const int kUnitCalcDataUnitIndexes[] = {0, 1, 2, 3, 4, 5, 6, 7, 8};
-
-static const UnitCalcTimeUnit kUnitCalcTimeUnits[] = {
-    {L"秒", 1.0},
-    {L"分钟", 60.0},
-    {L"小时", 3600.0},
-    {L"天", 86400.0},
-};
+static const int kUnitCalcRateUnitIndexes[] = {8, 9, 10, 11, 12, 13, 14, 15};
 
 struct UnitCalcWindowState {
   HWND hwnd{};
   HWND st_convert{};
   HWND st_bandwidth{};
+  HWND st_size_label{};
+  HWND st_rate_label{};
   HWND ed_value{};
   HWND cb_from{};
   HWND cb_to{};
@@ -1749,18 +2052,23 @@ static int UnitCalcGetComboUnitIndex(HWND combo) {
   return (int)SendMessageW(combo, CB_GETITEMDATA, (WPARAM)sel, 0);
 }
 
-static void UnitCalcFillTimeUnits(HWND combo) {
+static void UnitCalcFillRateUnits(HWND combo) {
   SendMessageW(combo, CB_RESETCONTENT, 0, 0);
-  for (int i = 0; i < (int)(sizeof(kUnitCalcTimeUnits) / sizeof(kUnitCalcTimeUnits[0])); i++) {
-    LRESULT item = SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)kUnitCalcTimeUnits[i].label);
-    SendMessageW(combo, CB_SETITEMDATA, (WPARAM)item, (LPARAM)i);
+  for (int idx : kUnitCalcRateUnitIndexes) {
+    LRESULT item = SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)kUnitCalcUnits[idx].label);
+    SendMessageW(combo, CB_SETITEMDATA, (WPARAM)item, (LPARAM)idx);
   }
 }
 
-static int UnitCalcGetTimeUnitIndex(HWND combo) {
-  int sel = (int)SendMessageW(combo, CB_GETCURSEL, 0, 0);
-  if (sel < 0) return -1;
-  return (int)SendMessageW(combo, CB_GETITEMDATA, (WPARAM)sel, 0);
+static std::wstring FormatDurationClock(double total_seconds) {
+  if (!std::isfinite(total_seconds) || total_seconds < 0.0) return L"--:--:--";
+  ULONGLONG rounded = (ULONGLONG)llround(total_seconds);
+  ULONGLONG hours = rounded / 3600ULL;
+  ULONGLONG minutes = (rounded % 3600ULL) / 60ULL;
+  ULONGLONG seconds = rounded % 60ULL;
+  wchar_t buf[64]{};
+  swprintf_s(buf, L"%llu:%02llu:%02llu", hours, minutes, seconds);
+  return buf;
 }
 
 static void UpdateUnitCalcResults(UnitCalcWindowState* s) {
@@ -1784,29 +2092,29 @@ static void UpdateUnitCalcResults(UnitCalcWindowState* s) {
   }
   SetWindowTextW(s->ed_result, convert_result.c_str());
 
-  std::wstring bw_result = L"请输入文件大小和耗时，计算所需带宽。";
+  std::wstring bw_result = L"请输入数据量和带宽，计算所需时间。";
   double size_value = 0.0;
-  double duration_value = 0.0;
+  double rate_value = 0.0;
   int size_idx = UnitCalcGetComboUnitIndex(s->cb_size_unit);
-  int duration_idx = UnitCalcGetTimeUnitIndex(s->cb_duration_unit);
+  int rate_idx = UnitCalcGetComboUnitIndex(s->cb_duration_unit);
   if (TryParseDoubleText(GetWindowTextWString(s->ed_size), &size_value) &&
-      TryParseDoubleText(GetWindowTextWString(s->ed_duration), &duration_value) &&
-      size_idx >= 0 && duration_idx >= 0) {
-    if (size_value < 0.0 || duration_value <= 0.0) {
-      bw_result = L"文件大小不能为负数，耗时必须大于 0。";
+      TryParseDoubleText(GetWindowTextWString(s->ed_duration), &rate_value) &&
+      size_idx >= 0 && rate_idx >= 0) {
+    if (size_value < 0.0 || rate_value <= 0.0) {
+      bw_result = L"数据量不能为负数，带宽必须大于 0。";
     } else {
       double total_bytes = size_value * kUnitCalcUnits[size_idx].bytes;
-      double total_seconds = duration_value * kUnitCalcTimeUnits[duration_idx].seconds;
-      double bytes_per_sec = total_bytes / total_seconds;
-      double mb_per_sec = bytes_per_sec / 1000.0 / 1000.0;
-      double mib_per_sec = bytes_per_sec / 1024.0 / 1024.0;
-      double mbps = bytes_per_sec * 8.0 / 1000.0 / 1000.0;
-      double gbps = mbps / 1000.0;
-      bw_result = L"需要带宽约:\r\n" +
-                  FormatDoubleCompact(mb_per_sec) + L" MB/s\r\n" +
-                  FormatDoubleCompact(mib_per_sec) + L" MiB/s\r\n" +
-                  FormatDoubleCompact(mbps) + L" Mbps\r\n" +
-                  FormatDoubleCompact(gbps) + L" Gbps";
+      double bytes_per_sec = rate_value * kUnitCalcUnits[rate_idx].bytes;
+      double total_seconds = total_bytes / bytes_per_sec;
+      double total_minutes = total_seconds / 60.0;
+      double total_hours = total_seconds / 3600.0;
+      double total_days = total_seconds / 86400.0;
+      bw_result = L"预计耗时:\r\n" +
+                  FormatDoubleCompact(total_seconds) + L" 秒\r\n" +
+                  FormatDoubleCompact(total_minutes) + L" 分钟\r\n" +
+                  FormatDoubleCompact(total_hours) + L" 小时\r\n" +
+                  FormatDoubleCompact(total_days) + L" 天\r\n" +
+                  L"约 " + FormatDurationClock(total_seconds);
     }
   }
   SetWindowTextW(s->ed_bw_result, bw_result.c_str());
@@ -1835,13 +2143,17 @@ static LRESULT CALLBACK UnitCalcWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
       s->ed_result = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", ro_style,
                                      0, 0, 10, 10, hwnd, (HMENU)IDC_UCALC_RESULT, nullptr, nullptr);
 
-      s->st_bandwidth = CreateWindowExW(0, L"STATIC", L"带宽需求", WS_CHILD | WS_VISIBLE,
+      s->st_bandwidth = CreateWindowExW(0, L"STATIC", L"耗时计算", WS_CHILD | WS_VISIBLE,
                                         0, 0, 10, 10, hwnd, nullptr, nullptr, nullptr);
+      s->st_size_label = CreateWindowExW(0, L"STATIC", L"数据量", WS_CHILD | WS_VISIBLE,
+                                         0, 0, 10, 10, hwnd, nullptr, nullptr, nullptr);
+      s->st_rate_label = CreateWindowExW(0, L"STATIC", L"带宽", WS_CHILD | WS_VISIBLE,
+                                         0, 0, 10, 10, hwnd, nullptr, nullptr, nullptr);
       s->ed_size = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"1", edit_style,
                                    0, 0, 10, 10, hwnd, (HMENU)IDC_UCALC_SIZE, nullptr, nullptr);
       s->cb_size_unit = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_TABSTOP,
                                         0, 0, 10, 10, hwnd, (HMENU)IDC_UCALC_SIZE_UNIT, nullptr, nullptr);
-      s->ed_duration = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"10", edit_style,
+      s->ed_duration = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"100", edit_style,
                                        0, 0, 10, 10, hwnd, (HMENU)IDC_UCALC_DURATION, nullptr, nullptr);
       s->cb_duration_unit = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_TABSTOP,
                                             0, 0, 10, 10, hwnd, (HMENU)IDC_UCALC_DURATION_UNIT, nullptr, nullptr);
@@ -1858,14 +2170,15 @@ static LRESULT CALLBACK UnitCalcWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
       UnitCalcFillUnits(s->cb_from, false);
       UnitCalcFillUnits(s->cb_to, false);
       UnitCalcFillUnits(s->cb_size_unit, true);
-      UnitCalcFillTimeUnits(s->cb_duration_unit);
+      UnitCalcFillRateUnits(s->cb_duration_unit);
       SendMessageW(s->cb_from, CB_SETCURSEL, 2, 0);
       SendMessageW(s->cb_to, CB_SETCURSEL, 3, 0);
       SendMessageW(s->cb_size_unit, CB_SETCURSEL, 3, 0);
-      SendMessageW(s->cb_duration_unit, CB_SETCURSEL, 1, 0);
+      SendMessageW(s->cb_duration_unit, CB_SETCURSEL, 2, 0);
 
       for (HWND h : {s->st_convert, s->ed_value, s->cb_from, s->cb_to, s->ed_result,
-                     s->st_bandwidth, s->ed_size, s->cb_size_unit, s->ed_duration, s->cb_duration_unit,
+                     s->st_bandwidth, s->st_size_label, s->st_rate_label,
+                     s->ed_size, s->cb_size_unit, s->ed_duration, s->cb_duration_unit,
                      s->ed_bw_result, s->btn_copy, s->btn_system, s->btn_close}) {
         SetControlFont(h, s->font);
       }
@@ -1902,6 +2215,10 @@ static LRESULT CALLBACK UnitCalcWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
       int half_w = (w - 3 * pad) / 2;
       int edit_w = half_w - unit_w - pad;
+      int field_lbl_h = ScalePx(hwnd, 18);
+      MoveWindow(s->st_size_label, x, y, half_w, field_lbl_h, TRUE);
+      MoveWindow(s->st_rate_label, x + half_w + pad, y, half_w, field_lbl_h, TRUE);
+      y += field_lbl_h + ScalePx(hwnd, 4);
       MoveWindow(s->ed_size, x, y, edit_w, row, TRUE);
       MoveWindow(s->cb_size_unit, x + edit_w + pad, y, unit_w, row + 220, TRUE);
       MoveWindow(s->ed_duration, x + half_w + pad, y, edit_w, row, TRUE);
@@ -1926,7 +2243,7 @@ static LRESULT CALLBACK UnitCalcWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
     case WM_GETMINMAXINFO: {
       auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
       if (!mmi) return 0;
-      RECT rc{0, 0, 700, 520};
+      RECT rc{0, 0, 860, 640};
       AdjustWindowRectEx(&rc, WS_OVERLAPPEDWINDOW, FALSE, WS_EX_DLGMODALFRAME);
       mmi->ptMinTrackSize.x = rc.right - rc.left;
       mmi->ptMinTrackSize.y = rc.bottom - rc.top;
@@ -1946,7 +2263,7 @@ static LRESULT CALLBACK UnitCalcWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
       }
       if (id == IDC_UCALC_COPY) {
         std::wstring text = L"单位换算:\r\n" + GetWindowTextWString(s->ed_result) +
-                            L"\r\n\r\n带宽需求:\r\n" + GetWindowTextWString(s->ed_bw_result);
+                            L"\r\n\r\n耗时计算:\r\n" + GetWindowTextWString(s->ed_bw_result);
         if (!CopyToClipboard(hwnd, text)) ShowInfoBox(hwnd, L"复制失败。", L"提示");
         return 0;
       }
@@ -1983,7 +2300,7 @@ static void ShowUnitCalcWindow(HWND owner) {
   UnitCalcWindowState state{};
   HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, wc.lpszClassName, L"单位计算与带宽需求",
                               WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 760, 560,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 920, 700,
                               owner, nullptr, wc.hInstance, &state);
   if (!hwnd) {
     ShowLastErrorBox(owner, L"CreateWindowEx(UnitCalc)");
@@ -1991,13 +2308,11 @@ static void ShowUnitCalcWindow(HWND owner) {
   }
   CenterOwnedWindowSimple(hwnd, owner);
 
-  EnableWindow(owner, FALSE);
   while (IsWindow(hwnd)) {
     MSG msg{};
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
       if (msg.message == WM_QUIT) {
         PostQuitMessage((int)msg.wParam);
-        EnableWindow(owner, TRUE);
         return;
       }
       TranslateMessage(&msg);
@@ -2005,8 +2320,6 @@ static void ShowUnitCalcWindow(HWND owner) {
     }
     WaitMessage();
   }
-  EnableWindow(owner, TRUE);
-  SetForegroundWindow(owner);
 }
 
 static void SetEditorMaximized(AppState* s, bool maximized) {
@@ -2239,7 +2552,7 @@ static void ClearEditor(AppState* s, bool allow_blank) {
   DateTime_SetSystemtime(s->ed_start, GDT_VALID, &s->selected);
   SYSTEMTIME next = AddDays(s->selected, 1);
   DateTime_SetSystemtime(s->ed_end, GDT_VALID, &next);
-  if (s->cb_status) SendMessageW(s->cb_status, CB_SETCURSEL, 0, 0);
+  if (s->cb_status) SendMessageW(s->cb_status, CB_SETCURSEL, 1, 0);
   SetEditText(s->ed_title, L"");
   SetEditText(s->ed_body, L"");
   ApplyBodyZoom(s);
@@ -2584,6 +2897,19 @@ static bool EntryVisibleOnDate(const Entry& e, const SYSTEMTIME& selected, const
   return false;
 }
 
+static bool DeleteFileBestEffort(const std::wstring& path, std::wstring* err) {
+  if (err) err->clear();
+  if (path.empty()) return true;
+  if (DeleteFileW(path.c_str()) != 0) return true;
+  DWORD le = GetLastError();
+  if (le == ERROR_FILE_NOT_FOUND || le == ERROR_PATH_NOT_FOUND) return true;
+  if (err) {
+    *err = L"无法删除临时文件：\n" + path +
+           L"\n(error=" + std::to_wstring(le) + L" " + FormatWin32ErrorMessage(le) + L")";
+  }
+  return false;
+}
+
 static bool EnumerateStoredDayDates(std::vector<SYSTEMTIME>* out, std::wstring* err) {
   if (!out) return false;
   out->clear();
@@ -2844,7 +3170,10 @@ static bool SaveEditorToModel(AppState* s, bool* out_changed) {
     if (out_changed) *out_changed = task_status_changed || task_meta_changed;
     if (task_status_changed || task_meta_changed) {
       std::wstring terr;
-      SaveTasks(s->tasks, &terr);
+      if (!SaveTasks(s->tasks, &terr)) {
+        ShowInfoBox(s->hwnd, terr.c_str(), L"保存任务失败");
+        return false;
+      }
     }
     return true;
   }
@@ -2909,6 +3238,7 @@ static bool SaveCurrent(AppState* s, bool rebuild_list = true) {
     }
   } guard{s, s ? s->suppress_dirty_prompt : false};
   if (s) s->suppress_dirty_prompt = true;
+  EditorCaretSnapshot caret = CaptureEditorCaretSnapshot(s);
 
   bool changed = false;
   if (!SaveEditorToModel(s, &changed)) return false;
@@ -2916,6 +3246,7 @@ static bool SaveCurrent(AppState* s, bool rebuild_list = true) {
     SetEditorDirty(s, false);
     if (s->ed_title) SendMessageW(s->ed_title, EM_SETMODIFY, FALSE, 0);
     if (s->ed_body) SendMessageW(s->ed_body, EM_SETMODIFY, FALSE, 0);
+    RestoreEditorCaretSnapshot(s, caret);
     UpdateStatusBar(s);
     return true;
   }
@@ -2932,11 +3263,16 @@ static bool SaveCurrent(AppState* s, bool rebuild_list = true) {
   if (s->ed_body) SendMessageW(s->ed_body, EM_SETMODIFY, FALSE, 0);
 
   if (rebuild_list) {
-    (void)LoadSelectedDay(s, s->selected);
+    if (!LoadSelectedDay(s, s->selected)) {
+      RestoreEditorCaretSnapshot(s, caret);
+      UpdateStatusBar(s);
+      ShowInfoBox(s->hwnd, L"条目已经保存，但界面重新加载失败。请重新选择日期，必要时重启程序。", L"保存后重载失败");
+      return true;
+    }
   } else if (s->editing_index >= 0 && s->editing_index < (int)s->day.entries.size()) {
     UpdateListRowForEntry(s, s->editing_index);
   }
-  SetFocus(s->ed_body ? s->ed_body : s->ed_title);
+  RestoreEditorCaretSnapshot(s, caret);
   ShowToast(s, L"已保存");
   UpdateStatusBar(s);
   return true;
@@ -2945,6 +3281,7 @@ static bool SaveCurrent(AppState* s, bool rebuild_list = true) {
 static bool AutoSaveCurrent(AppState* s) {
   if (!s) return false;
   if (s->editing_index < 0 || s->editing_index >= (int)s->day.entries.size()) return false;
+  EditorCaretSnapshot caret = CaptureEditorCaretSnapshot(s);
 
   Entry original_entry = s->day.entries[(size_t)s->editing_index];
   std::vector<Task> tasks_copy = s->tasks;
@@ -3052,6 +3389,7 @@ static bool AutoSaveCurrent(AppState* s) {
       UpdateListRowForEntry(s, s->editing_index);
     }
   }
+  RestoreEditorCaretSnapshot(s, caret);
   UpdateStatusBar(s);
   return true;
 }
@@ -3976,7 +4314,6 @@ static bool PromptPickTaskId(AppState* app, std::wstring* out_task_id) {
     WaitMessage();
   }
   EnableWindow(app->hwnd, TRUE);
-  SetForegroundWindow(app->hwnd);
 
   if (state.ok && out_task_id) *out_task_id = state.out_id;
   return state.ok;
@@ -4096,7 +4433,6 @@ static void ShowReportWindow(HWND owner, const std::wstring& title, const std::w
     return;
   }
 
-  EnableWindow(owner, FALSE);
   // Modal loop without posting WM_QUIT (WM_QUIT would terminate the whole app).
   while (IsWindow(hwnd)) {
     MSG msg{};
@@ -4104,7 +4440,6 @@ static void ShowReportWindow(HWND owner, const std::wstring& title, const std::w
       if (msg.message == WM_QUIT) {
         // Re-post and exit; caller (main loop) will handle it.
         PostQuitMessage((int)msg.wParam);
-        EnableWindow(owner, TRUE);
         return;
       }
       TranslateMessage(&msg);
@@ -4112,8 +4447,6 @@ static void ShowReportWindow(HWND owner, const std::wstring& title, const std::w
     }
     WaitMessage();
   }
-  EnableWindow(owner, TRUE);
-  SetForegroundWindow(owner);
 }
 
 struct PreviewWindowState {
@@ -4360,13 +4693,11 @@ static void ShowPreviewWindow(HWND owner, const std::wstring& title, const std::
     return;
   }
 
-  EnableWindow(owner, FALSE);
   while (IsWindow(hwnd)) {
     MSG msg{};
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
       if (msg.message == WM_QUIT) {
         PostQuitMessage((int)msg.wParam);
-        EnableWindow(owner, TRUE);
         return;
       }
       TranslateMessage(&msg);
@@ -4374,8 +4705,6 @@ static void ShowPreviewWindow(HWND owner, const std::wstring& title, const std::
     }
     WaitMessage();
   }
-  EnableWindow(owner, TRUE);
-  SetForegroundWindow(owner);
 }
 
 enum class ReportMode {
@@ -4727,7 +5056,6 @@ static void ShowManageCategoriesWindow(AppState* app) {
     WaitMessage();
   }
   EnableWindow(app->hwnd, TRUE);
-  SetForegroundWindow(app->hwnd);
 }
 
 struct TaskWindowState {
@@ -5105,7 +5433,6 @@ static std::wstring TaskMaterialsDirResolved(const Task& t) {
 }
 
 static bool ConfirmMaterialsPathIfExternal(HWND owner, const std::wstring& picked_dir) {
-  std::wstring data_root = GetDataRootDir();
   if (picked_dir.empty()) return true;
   if (IsNetworkPathForbidden(picked_dir)) {
     ShowInfoBox(owner, L"不允许设置为网络共享路径(UNC)。请改为本地磁盘目录。", L"提示");
@@ -5114,14 +5441,6 @@ static bool ConfirmMaterialsPathIfExternal(HWND owner, const std::wstring& picke
   if (!DirExistsW(picked_dir)) {
     ShowInfoBox(owner, L"所选路径不存在或不是文件夹。", L"提示");
     return false;
-  }
-  if (!IsSameOrChildDir(data_root, picked_dir)) {
-    int r = MessageBoxW(owner,
-                        L"该材料路径不在 WorkLogLite 数据目录内。\n\n"
-                        L"说明：导出/导入“全量数据”只会拷贝 data 目录，无法携带 data 目录之外的外部文件。\n\n"
-                        L"仍要继续使用该路径吗？",
-                        kAppTitle, MB_YESNO | MB_ICONQUESTION);
-    if (r != IDYES) return false;
   }
   return true;
 }
@@ -5811,7 +6130,6 @@ static void ShowManageRecurringMeetingsWindow(AppState* app) {
     WaitMessage();
   }
   EnableWindow(app->hwnd, TRUE);
-  SetForegroundWindow(app->hwnd);
 }
 
 #endif  // 0
@@ -5883,7 +6201,7 @@ static LRESULT CALLBACK TaskWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       SendMessageW(s->cb_status, CB_ADDSTRING, 0, (LPARAM)L"进行中");
       SendMessageW(s->cb_status, CB_ADDSTRING, 0, (LPARAM)L"阻塞");
       SendMessageW(s->cb_status, CB_ADDSTRING, 0, (LPARAM)L"已完成");
-      SendMessageW(s->cb_status, CB_SETCURSEL, 0, 0);
+      SendMessageW(s->cb_status, CB_SETCURSEL, 1, 0);
 
       s->lbl_desc = CreateWindowExW(0, L"STATIC", L"任务说明(支持富文本，可做段落/编号/缩进)",
                                     WS_CHILD | WS_VISIBLE,
@@ -6289,7 +6607,6 @@ static void ShowManageTasksWindow(AppState* app, const Task* preinsert) {
     WaitMessage();
   }
   EnableWindow(app->hwnd, TRUE);
-  SetForegroundWindow(app->hwnd);
 }
 
 static void Layout(AppState* s) {
@@ -6323,7 +6640,7 @@ static void Layout(AppState* s) {
     for (HWND b : {s->btn_screenshot, s->btn_quick_reply, s->btn_timestamp, s->btn_focus_timer, s->btn_calc,
                    s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials, s->btn_open_materials,
                    s->btn_set_materials, s->btn_color_picker, s->btn_paste_plain, s->btn_record_system,
-                   s->btn_record_mic, s->btn_recordings_dir, s->btn_date_separator}) {
+                   s->btn_record_mic, s->btn_recordings_dir, s->btn_templates, s->btn_date_separator}) {
       set_vis(b, visible);
     }
   };
@@ -6423,11 +6740,12 @@ static void Layout(AppState* s) {
     s->btn_screenshot, s->btn_screenshot_dir,
     s->btn_record_system, s->btn_record_mic,
     s->btn_recordings_dir, s->btn_color_picker,
-    s->btn_quick_reply, s->btn_timestamp,
-    s->btn_paste_plain, s->btn_date_separator,
-    s->btn_task_materials, s->btn_focus_timer,
-    s->btn_calc, s->btn_open_materials,
-    s->btn_set_materials, s->btn_data_dir
+    s->btn_templates, s->btn_quick_reply,
+    s->btn_timestamp, s->btn_paste_plain,
+    s->btn_date_separator, s->btn_task_materials,
+    s->btn_focus_timer, s->btn_calc,
+    s->btn_open_materials, s->btn_set_materials,
+    s->btn_data_dir
   };
   for (size_t i = 0; i < btns.size(); i++) {
     HWND b = btns[i];
@@ -6860,6 +7178,9 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       s->btn_recordings_dir = CreateWindowExW(0, L"BUTTON", L"录音目录",
                                               office_btn_style,
                                               0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_RECORDINGS_DIR, nullptr, nullptr);
+      s->btn_templates = CreateWindowExW(0, L"BUTTON", L"模板",
+                                         office_btn_style,
+                                         0, 0, 10, 10, hwnd, (HMENU)IDC_BTN_TEMPLATES, nullptr, nullptr);
 
       // Fonts
       for (HWND h : {s->cal, s->st_day, s->list, s->lbl_category, s->lbl_start, s->lbl_end, s->lbl_title, s->lbl_body,
@@ -6874,7 +7195,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                      s->grp_office, s->btn_screenshot, s->btn_quick_reply, s->btn_timestamp, s->btn_focus_timer, s->btn_calc,
                       s->btn_data_dir, s->btn_screenshot_dir, s->btn_task_materials, s->btn_open_materials, s->btn_set_materials,
                       s->btn_color_picker, s->btn_paste_plain, s->btn_date_separator,
-                      s->btn_record_system, s->btn_record_mic, s->btn_recordings_dir}) {
+                      s->btn_record_system, s->btn_record_mic, s->btn_recordings_dir, s->btn_templates}) {
         SetControlFont(h, s->font);
       }
 
@@ -6994,7 +7315,12 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         KillTimer(s->hwnd, s->autosave_timer_id);
         s->autosave_timer_id = 0;
         if (s->editing_index >= 0 && IsEditorTrulyDirty(s)) {
-          if (AutoSaveCurrent(s)) ShowToast(s, L"已自动保存");
+          if (AutoSaveCurrent(s)) {
+            ShowToast(s, L"已自动保存");
+          } else {
+            UpdateStatusBar(s);
+            ShowToast(s, L"自动保存失败");
+          }
         }
         return 0;
       }
@@ -7020,7 +7346,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
           id == IDC_BTN_CALC || id == IDC_BTN_DATA_DIR || id == IDC_BTN_SCREENSHOT_DIR || id == IDC_BTN_TASK_MATERIALS_ROOT ||
           id == IDC_BTN_OPEN_MATERIALS || id == IDC_BTN_SET_MATERIALS || id == IDC_BTN_COLOR_PICKER ||
           id == IDC_BTN_PASTE_PLAIN || id == IDC_BTN_DATE_SEPARATOR || id == IDC_BTN_RECORD_SYSTEM || id == IDC_BTN_RECORD_MIC ||
-          id == IDC_BTN_RECORDINGS_DIR || id == IDC_FMT_BOLD || id == IDC_FMT_ITALIC || id == IDC_FMT_UNDERLINE ||
+          id == IDC_BTN_RECORDINGS_DIR || id == IDC_BTN_TEMPLATES || id == IDC_FMT_BOLD || id == IDC_FMT_ITALIC || id == IDC_FMT_UNDERLINE ||
           id == IDC_FMT_SUPERSCRIPT || id == IDC_FMT_SUBSCRIPT || id == IDC_FMT_NUMBERING || id == IDC_FMT_BULLET ||
           id == IDC_FMT_MARKDOWN || id == IDC_FMT_ALIGN_LEFT || id == IDC_FMT_ALIGN_CENTER || id == IDC_FMT_ALIGN_RIGHT ||
           id == IDC_FMT_INDENT_INC || id == IDC_FMT_INDENT_DEC || id == IDC_FMT_CLEAR || id == IDC_BTN_BODY_MAXIMIZE ||
@@ -7064,6 +7390,10 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
       }
       if (id == IDC_BTN_QUICK_REPLY && code == BN_CLICKED) {
         ShowQuickReplyMenu(s);
+        return 0;
+      }
+      if (id == IDC_BTN_TEMPLATES && code == BN_CLICKED) {
+        ShowTemplateMenu(s);
         return 0;
       }
       if (id == IDC_BTN_TIMESTAMP && code == BN_CLICKED) {
